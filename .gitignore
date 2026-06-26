@@ -2,15 +2,16 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+.vscode/
 # C extensions
 *.so
-
+notebooks/
 # Distribution / packaging
 .Python
 build/
 develop-eggs/
 dist/
+data/
 downloads/
 eggs/
 .eggs/
