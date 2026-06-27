@@ -15,6 +15,7 @@ data/
 downloads/
 eggs/
 .eggs/
+outputs/
 lib/
 lib64/
 parts/
