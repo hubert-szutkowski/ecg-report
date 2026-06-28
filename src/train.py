@@ -15,17 +15,17 @@ import shutil
 import pandas as pd
 
 
-# ── Wykresy ───────────────────────────────────────────────────────────────────
+
 def plot_loss(history, fold_number):
     loss     = history.history['loss']
     val_loss = history.history['val_loss']
     epochs   = range(1, len(loss) + 1)
 
     plt.figure(figsize=(10, 6))
-    plt.plot(epochs, loss,     'bo-', label='Trening (Loss)')
-    plt.plot(epochs, val_loss, 'ro-', label='Walidacja (Val Loss)')
-    plt.title('Krzywa uczenia: Loss')
-    plt.xlabel('Epoki')
+    plt.plot(epochs, loss,     'bo-', label='Training (Loss)')
+    plt.plot(epochs, val_loss, 'ro-', label='Validation (Val Loss)')
+    plt.title('Learning Curve: Loss')
+    plt.xlabel('Epochs')
     plt.ylabel('Loss')
     plt.legend()
     plt.grid(True)
@@ -82,13 +82,13 @@ LABELS = MASTER_DATA['label']
 GROUPS = np.array(GROUPS)
 
 FOLD_SPLITS = 5
-WINDOW      = 4096
-STRIDE      = 512
+WINDOW      = 1024
+STRIDE      = 128
 
-print(f"Rozmiar sygnału: {len(SIGNAL)}")
-print(f"Rozmiar etykiet: {len(LABELS)}")
-print(f"Rozmiar grup:    {len(GROUPS)}")
-print(f"Rozkład klas:    {np.bincount(LABELS)}")
+print(f"Size of signal: {len(SIGNAL)}")
+print(f"Size of labels: {len(LABELS)}")
+print(f"Size of groups:    {len(GROUPS)}")
+print(f"Class distribution:    {np.bincount(LABELS)}")
 
 os.makedirs('outputs', exist_ok=True)
 
@@ -109,8 +109,8 @@ for train_idx, test_idx in GroupKFold(n_splits=FOLD_SPLITS).split(SIGNAL, LABELS
     y_train_raw = LABELS.iloc[train_idx].values
     y_test_raw  = LABELS.iloc[test_idx].values
 
-    print(f"Trening - Wierszy: {len(X_train_raw)}, Grupy: {np.unique(GROUPS[train_idx])}")
-    print(f"Test    - Wierszy: {len(X_test_raw)},  Grupy: {np.unique(GROUPS[test_idx])}")
+    print(f"Training - Rows: {len(X_train_raw)}, Groups: {np.unique(GROUPS[train_idx])}")
+    print(f"Test    - Rows: {len(X_test_raw)},  Groups: {np.unique(GROUPS[test_idx])}")
 
    
     scaler = StandardScaler()
@@ -125,10 +125,10 @@ for train_idx, test_idx in GroupKFold(n_splits=FOLD_SPLITS).split(SIGNAL, LABELS
     X_test_w  = make_windows(X_test_scaled, WINDOW, STRIDE)
     y_test_w  = make_window_labels(y_test_raw,  WINDOW, STRIDE)
 
-    print(f"Okna treningowe: {X_train_w.shape}, etykiety: {y_train_w.shape}")
-    print(f"Okna testowe:    {X_test_w.shape},  etykiety: {y_test_w.shape}")
-    print(f"Train - Klasy: {np.bincount(y_train_w)}")
-    print(f"Val   - Klasy: {np.bincount(y_test_w)}")
+    print(f"Training windows: {X_train_w.shape}, labels: {y_train_w.shape}")
+    print(f"Test windows:    {X_test_w.shape},  labels: {y_test_w.shape}")
+    print(f"Train - Classes: {np.bincount(y_train_w)}")
+    print(f"Val   - Classes: {np.bincount(y_test_w)}")
 
     
     class_weights = compute_class_weight('balanced', classes=np.array([0, 1]), y=y_train_w)
@@ -179,7 +179,7 @@ for train_idx, test_idx in GroupKFold(n_splits=FOLD_SPLITS).split(SIGNAL, LABELS
     best_train_loss  = history.history['loss'][best_epoch]
 
     print(
-        f"Fold {fold_number} | Najlepsza epoka: {best_epoch + 1} | "
+        f"Fold {fold_number} | Best epoch: {best_epoch + 1} | "
         f"Train Acc={best_train_acc:.4f}, Loss={best_train_loss:.4f} | "
         f"Val Acc={best_val_acc:.4f}, Val Loss={best_val_loss:.4f}"
     )
@@ -204,5 +204,5 @@ shutil.copy(
     'outputs/best_overall_model.keras'
 )
 print(f"\n{'='*50}")
-print(f"Najlepszy fold: {best_fold} | Val Loss: {best_val:.4f}")
-print(f"Zapisano: outputs/best_overall_model.keras")
+print(f"Best fold: {best_fold} | Val Loss: {best_val:.4f}")
+print(f"Saved: outputs/best_overall_model.keras")

@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-# ✅ Globalny symbol normalnego rytmu — zawsze ten sam numer klasy
+
 NORMAL_SYMBOL = 'N'
 
 
@@ -25,14 +25,14 @@ def get_record_ids(data_dir: str) -> list:
 def get_record(dir_path: str, sample_select: int = 0) -> pd.DataFrame:
     """
     Getting a specific record from the data directory.
-    Etykiety: N → 0 (normalny), wszystko inne → 1 (anomalia).
-    Mapowanie jest GLOBALNE — identyczne dla każdego pacjenta.
+    Labels are binary: N=0, others=1 — consistent for EACH patient.
+
 
     Parameters:
         dir_path (str): The path to the data directory.
         sample_select (int): The index of the record to select.
     Returns:
-        pd.DataFrame: DataFrame z kolumnami 'signal' (float) i 'label' (0/1).
+        pd.DataFrame: DataFrame with columns 'signal' (float) and 'label' (0/1).
     """
     records_ids  = get_record_ids(dir_path)
     record_path  = str(Path(dir_path) / str(records_ids[sample_select]))
@@ -44,7 +44,7 @@ def get_record(dir_path: str, sample_select: int = 0) -> pd.DataFrame:
     signals, _ = wfdb.rdsamp(record_path, channels=[0])
     n_samples  = len(signals)
 
-    # ✅ Binarne etykiety: N=0, reszta=1 — spójne dla KAŻDEGO pacjenta
+    
     labels = np.zeros(n_samples, dtype=int)
 
     for i, (sample_pos, symbol) in enumerate(zip(features_samples, features)):
@@ -54,15 +54,15 @@ def get_record(dir_path: str, sample_select: int = 0) -> pd.DataFrame:
         end   = features_samples[i + 1] if i + 1 < len(features_samples) else n_samples
         labels[start:end] = label_value
 
-    # Diagnostyka per pacjent
+    
     n_normal  = (labels == 0).sum()
     n_anomaly = (labels == 1).sum()
     unique_symbols = np.unique(features)
     print(
         f"Record {records_ids[sample_select]:>6} | "
-        f"Symbole: {sorted(unique_symbols)} | "
+        f"Symbols: {sorted(unique_symbols)} | "
         f"N={n_normal} ({n_normal/n_samples*100:.1f}%) | "
-        f"anomalia={n_anomaly} ({n_anomaly/n_samples*100:.1f}%)"
+        f"anomaly={n_anomaly} ({n_anomaly/n_samples*100:.1f}%)"
     )
 
     return pd.DataFrame({'signal': signals.flatten(), 'label': labels})
