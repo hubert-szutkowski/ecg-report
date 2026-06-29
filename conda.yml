@@ -1,0 +1,15 @@
+name: ecg-env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip:
+    - tensorflow
+    - scikit-learn
+    - pandas
+    - numpy
+    - wfdb
+    - matplotlib
+    - joblib
+    - mlflow
+    - azureml-mlflow

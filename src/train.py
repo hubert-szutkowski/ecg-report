@@ -1,6 +1,5 @@
 import csv
 from preprocessing import get_record_ids, data_loader
-from pathlib import Path
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.model_selection import GroupKFold
@@ -14,6 +13,10 @@ from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCh
 import shutil
 import pandas as pd
 import argparse
+import mlflow
+import mlflow.tensorflow
+
+mlflow.tensorflow.autolog()
 
 parser = argparse.ArgumentParser(description="ECG Training Pipeline")
 parser.add_argument("--data-dir", type=str, required=True, help="Path to raw ECG data")
@@ -23,6 +26,8 @@ parser.add_argument("--stride", type=int, default=256, help="Stride size for sli
 parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
 
 args = parser.parse_args()
+
+run = mlflow.start_run()
 
 def plot_loss(history, fold_number):
     loss     = history.history['loss']
@@ -74,10 +79,6 @@ def make_window_labels(labels: np.ndarray, window_size: int, stride: int) -> np.
         arr=label_windows
     )
 
-
-
-# base_dir   = Path(__file__).resolve().parent.parent
-# dir_path   = base_dir / 'data'
 dir_path_str = str(args.data_dir)
 
 record_ids= get_record_ids(dir_path_str)
@@ -214,3 +215,14 @@ shutil.copy(
 print(f"\n{'='*50}")
 print(f"Best fold: {best_fold} | Val Loss: {best_val:.4f}")
 print(f"Saved: outputs/best_overall_model.keras")
+
+print("Uploading best model to MLflow artifacts...")
+mlflow.log_artifact("outputs/best_overall_model.keras", artifact_path="final_model")
+
+print("Registering the best model with MLflow...")
+mlflow.register_model(
+    model_uri=f"runs:/{run.info.run_id}/final_model",
+    name="ecg-anomaly-detector-model"
+)
+
+mlflow.end_run()
