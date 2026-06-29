@@ -13,8 +13,16 @@ import matplotlib.pyplot as plt
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 import shutil
 import pandas as pd
+import argparse
 
+parser = argparse.ArgumentParser(description="ECG Training Pipeline")
+parser.add_argument("--data-dir", type=str, required=True, help="Path to raw ECG data")
+parser.add_argument("--selected-samples", type=int, default=20, help="Number of ECG records to load")
+parser.add_argument("--window", type=int, default=1024, help="Sliding window size")
+parser.add_argument("--stride", type=int, default=256, help="Stride size for sliding window")
+parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
 
+args = parser.parse_args()
 
 def plot_loss(history, fold_number):
     loss     = history.history['loss']
@@ -68,12 +76,12 @@ def make_window_labels(labels: np.ndarray, window_size: int, stride: int) -> np.
 
 
 
-base_dir   = Path(__file__).resolve().parent.parent
-dir_path   = base_dir / 'data'
-dir_path_str = str(dir_path)
+# base_dir   = Path(__file__).resolve().parent.parent
+# dir_path   = base_dir / 'data'
+dir_path_str = str(args.data_dir)
 
-record_ids               = get_record_ids(dir_path_str)
-SELECTED_NUMBER_OF_SAMPLES = 20
+record_ids= get_record_ids(dir_path_str)
+SELECTED_NUMBER_OF_SAMPLES = args.selected_samples
 
 MASTER_DATA, GROUPS = data_loader(dir_path_str, selected_number_of_samples=SELECTED_NUMBER_OF_SAMPLES)
 
@@ -82,8 +90,8 @@ LABELS = MASTER_DATA['label']
 GROUPS = np.array(GROUPS)
 
 FOLD_SPLITS = 5
-WINDOW      = 1024
-STRIDE      = 128
+WINDOW      = args.window
+STRIDE      = args.stride
 
 print(f"Size of signal: {len(SIGNAL)}")
 print(f"Size of labels: {len(LABELS)}")
@@ -164,7 +172,7 @@ for train_idx, test_idx in GroupKFold(n_splits=FOLD_SPLITS).split(SIGNAL, LABELS
     
     history = model.fit(
         X_train_w, y_train_w,
-        epochs=30,
+        epochs=args.epochs,
         validation_data=(X_test_w, y_test_w),
         class_weight=class_weight_dict,
         callbacks=callbacks,
