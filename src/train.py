@@ -16,7 +16,7 @@ import argparse
 import mlflow
 import mlflow.tensorflow
 import tensorflow as tf 
-
+from sklearn.model_selection import StratifiedGroupKFold
 
 
 parser = argparse.ArgumentParser(description="ECG Training Pipeline")
@@ -25,6 +25,7 @@ parser.add_argument("--selected-samples", type=int, default=20, help="Number of 
 parser.add_argument("--window", type=int, default=1024, help="Sliding window size")
 parser.add_argument("--stride", type=int, default=256, help="Stride size for sliding window")
 parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
+parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
 
 args = parser.parse_args()
 
@@ -32,7 +33,8 @@ mlflow.log_params({
     "window_size": args.window,
     "stride": args.stride,
     "epochs": args.epochs,
-    "selected_samples": args.selected_samples
+    "selected_samples": args.selected_samples,
+    "random_seed": args.random_seed
 })
 
 
@@ -127,7 +129,7 @@ with open('outputs/metrics.csv', 'w', newline='') as f:
 
 
 fold_number = 0
-for train_idx, test_idx in GroupKFold(n_splits=FOLD_SPLITS).split(SIGNAL, LABELS, GROUPS):
+for train_idx, test_idx in StratifiedGroupKFold(n_splits=FOLD_SPLITS, shuffle=True, random_state=args.random_seed).split(SIGNAL, LABELS, GROUPS):
     print(f"\n{'='*50}\nFold {fold_number}\n{'='*50}")
 
     X_train_raw = SIGNAL.iloc[train_idx]
