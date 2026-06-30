@@ -1,10 +1,11 @@
 name: ecg-env
 channels:
   - conda-forge
+  - defaults
 dependencies:
   - python=3.10
   - pip:
-    - tensorflow
+    - tensorflow==2.21.0
     - scikit-learn
     - pandas
     - numpy
@@ -13,3 +14,4 @@ dependencies:
     - joblib
     - mlflow
     - azureml-mlflow
+    - azureml-core

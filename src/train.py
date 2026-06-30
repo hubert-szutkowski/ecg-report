@@ -15,8 +15,9 @@ import pandas as pd
 import argparse
 import mlflow
 import mlflow.tensorflow
+import tensorflow as tf 
 
-mlflow.tensorflow.autolog()
+
 
 parser = argparse.ArgumentParser(description="ECG Training Pipeline")
 parser.add_argument("--data-dir", type=str, required=True, help="Path to raw ECG data")
@@ -27,7 +28,25 @@ parser.add_argument("--epochs", type=int, default=30, help="Number of training e
 
 args = parser.parse_args()
 
-run = mlflow.start_run()
+mlflow.log_params({
+    "window_size": args.window,
+    "stride": args.stride,
+    "epochs": args.epochs,
+    "selected_samples": args.selected_samples
+})
+
+
+
+class MLflowFoldCallback(tf.keras.callbacks.Callback):
+    def __init__(self, fold_num):
+        super().__init__()
+        self.fold_num = fold_num
+
+    def on_epoch_end(self, epoch, logs=None):
+        if logs:
+            for key, value in logs.items():
+                mlflow.log_metric(f"fold_{self.fold_num}_{key}", value, step=epoch)
+
 
 def plot_loss(history, fold_number):
     loss     = history.history['loss']
@@ -147,6 +166,7 @@ for train_idx, test_idx in GroupKFold(n_splits=FOLD_SPLITS).split(SIGNAL, LABELS
     
     model = build_ecg_model(input_shape=(WINDOW, 1), n_classes=1)
 
+   
     callbacks = [
         EarlyStopping(
             monitor='val_loss',
@@ -161,13 +181,14 @@ for train_idx, test_idx in GroupKFold(n_splits=FOLD_SPLITS).split(SIGNAL, LABELS
             min_lr=1e-6,
             verbose=1
         ),
-        
         ModelCheckpoint(
             filepath=f'outputs/best_model_fold_{fold_number}.keras',
             monitor='val_loss',
             save_best_only=True,
             verbose=1
         ),
+        
+        MLflowFoldCallback(fold_num=fold_number)
     ]
 
     
@@ -186,6 +207,10 @@ for train_idx, test_idx in GroupKFold(n_splits=FOLD_SPLITS).split(SIGNAL, LABELS
     best_val_acc     = history.history['val_accuracy'][best_epoch]
     best_train_acc   = history.history['accuracy'][best_epoch]
     best_train_loss  = history.history['loss'][best_epoch]
+
+    
+    mlflow.log_metric(f"best_val_loss_fold_{fold_number}", best_val_loss)
+    mlflow.log_metric(f"best_val_acc_fold_{fold_number}", best_val_acc)
 
     print(
         f"Fold {fold_number} | Best epoch: {best_epoch + 1} | "
@@ -208,6 +233,15 @@ metrics_df = pd.read_csv('outputs/metrics.csv')
 best_fold  = int(metrics_df.loc[metrics_df['Val Loss'].idxmin(), 'Fold'])
 best_val   = metrics_df['Val Loss'].min()
 
+
+mean_val_loss = metrics_df['Val Loss'].mean()
+mean_val_acc = metrics_df['Val Acc'].mean()
+
+mlflow.log_metric("cv_mean_val_loss", mean_val_loss)
+mlflow.log_metric("cv_mean_val_acc", mean_val_acc)
+mlflow.log_metric("best_fold_number", best_fold)
+
+
 shutil.copy(
     f'outputs/best_model_fold_{best_fold}.keras',
     'outputs/best_overall_model.keras'
@@ -216,13 +250,3 @@ print(f"\n{'='*50}")
 print(f"Best fold: {best_fold} | Val Loss: {best_val:.4f}")
 print(f"Saved: outputs/best_overall_model.keras")
 
-print("Uploading best model to MLflow artifacts...")
-mlflow.log_artifact("outputs/best_overall_model.keras", artifact_path="final_model")
-
-print("Registering the best model with MLflow...")
-mlflow.register_model(
-    model_uri=f"runs:/{run.info.run_id}/final_model",
-    name="ecg-anomaly-detector-model"
-)
-
-mlflow.end_run()
