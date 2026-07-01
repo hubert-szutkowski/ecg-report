@@ -17,6 +17,7 @@ import mlflow
 import mlflow.tensorflow
 import tensorflow as tf 
 from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
 
 parser = argparse.ArgumentParser(description="ECG Training Pipeline")
@@ -124,7 +125,7 @@ os.makedirs('outputs', exist_ok=True)
 
 
 with open('outputs/metrics.csv', 'w', newline='') as f:
-    csv.writer(f).writerow(['Fold', 'Best Epoch', 'Train Acc', 'Val Acc', 'Train Loss', 'Val Loss'])
+    csv.writer(f).writerow(['Fold', 'Best Epoch', 'Train Acc', 'Val Acc', 'Train Loss', 'Val Loss', 'Val Recall'])
 
 
 
@@ -209,22 +210,43 @@ for train_idx, test_idx in StratifiedGroupKFold(n_splits=FOLD_SPLITS, shuffle=Tr
     best_val_acc     = history.history['val_accuracy'][best_epoch]
     best_train_acc   = history.history['accuracy'][best_epoch]
     best_train_loss  = history.history['loss'][best_epoch]
+    best_val_recall  = history.history['val_recall'][best_epoch]
 
     
+    y_pred = (model.predict(X_test_w) > 0.5).astype(int).flatten()
+    
+    cm = confusion_matrix(y_test_w, y_pred)
+    
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[0, 1])
+    disp.plot(cmap=plt.cm.Blues, ax=ax)
+    
+    plt.title(f'Confusion Matrix - Fold {fold_number}')
+    plt.savefig(f'outputs/confusion_matrix_fold_{fold_number}.png')
+    
+   
+    
+    
+  
+    plt.close(fig)
+
     mlflow.log_metric(f"best_val_loss_fold_{fold_number}", best_val_loss)
     mlflow.log_metric(f"best_val_acc_fold_{fold_number}", best_val_acc)
+    mlflow.log_metric(f"best_val_recall_fold_{fold_number}", best_val_recall)
 
     print(
         f"Fold {fold_number} | Best epoch: {best_epoch + 1} | "
         f"Train Acc={best_train_acc:.4f}, Loss={best_train_loss:.4f} | "
-        f"Val Acc={best_val_acc:.4f}, Val Loss={best_val_loss:.4f}"
+        f"Val Acc={best_val_acc:.4f}, Val Loss={best_val_loss:.4f}, Val Recall={best_val_recall:.4f}"
     )
 
     with open('outputs/metrics.csv', 'a', newline='') as f:
         csv.writer(f).writerow([
             fold_number, best_epoch + 1,
             best_train_acc, best_val_acc,
-            best_train_loss, best_val_loss
+            best_train_loss, best_val_loss,
+            best_val_recall
         ])
 
     plot_loss(history, fold_number)
@@ -238,10 +260,12 @@ best_val   = metrics_df['Val Loss'].min()
 
 mean_val_loss = metrics_df['Val Loss'].mean()
 mean_val_acc = metrics_df['Val Acc'].mean()
+mean_val_recall = metrics_df['Val Recall'].mean()
 
 mlflow.log_metric("cv_mean_val_loss", mean_val_loss)
 mlflow.log_metric("cv_mean_val_acc", mean_val_acc)
 mlflow.log_metric("best_fold_number", best_fold)
+mlflow.log_metric("cv_mean_val_recall", mean_val_recall)
 
 
 shutil.copy(
