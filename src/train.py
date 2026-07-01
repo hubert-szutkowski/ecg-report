@@ -1,6 +1,5 @@
 import csv
 from preprocessing import get_record_ids, data_loader
-from pathlib import Path
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.model_selection import GroupKFold
@@ -13,7 +12,43 @@ import matplotlib.pyplot as plt
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 import shutil
 import pandas as pd
+import argparse
+import mlflow
+import mlflow.tensorflow
+import tensorflow as tf 
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
+
+parser = argparse.ArgumentParser(description="ECG Training Pipeline")
+parser.add_argument("--data-dir", type=str, required=True, help="Path to raw ECG data")
+parser.add_argument("--selected-samples", type=int, default=20, help="Number of ECG records to load")
+parser.add_argument("--window", type=int, default=1024, help="Sliding window size")
+parser.add_argument("--stride", type=int, default=256, help="Stride size for sliding window")
+parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
+parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
+
+args = parser.parse_args()
+
+mlflow.log_params({
+    "window_size": args.window,
+    "stride": args.stride,
+    "epochs": args.epochs,
+    "selected_samples": args.selected_samples,
+    "random_seed": args.random_seed
+})
+
+
+
+class MLflowFoldCallback(tf.keras.callbacks.Callback):
+    def __init__(self, fold_num):
+        super().__init__()
+        self.fold_num = fold_num
+
+    def on_epoch_end(self, epoch, logs=None):
+        if logs:
+            for key, value in logs.items():
+                mlflow.log_metric(f"fold_{self.fold_num}_{key}", value, step=epoch)
 
 
 def plot_loss(history, fold_number):
@@ -66,14 +101,10 @@ def make_window_labels(labels: np.ndarray, window_size: int, stride: int) -> np.
         arr=label_windows
     )
 
+dir_path_str = str(args.data_dir)
 
-
-base_dir   = Path(__file__).resolve().parent.parent
-dir_path   = base_dir / 'data'
-dir_path_str = str(dir_path)
-
-record_ids               = get_record_ids(dir_path_str)
-SELECTED_NUMBER_OF_SAMPLES = 20
+record_ids= get_record_ids(dir_path_str)
+SELECTED_NUMBER_OF_SAMPLES = args.selected_samples
 
 MASTER_DATA, GROUPS = data_loader(dir_path_str, selected_number_of_samples=SELECTED_NUMBER_OF_SAMPLES)
 
@@ -82,8 +113,8 @@ LABELS = MASTER_DATA['label']
 GROUPS = np.array(GROUPS)
 
 FOLD_SPLITS = 5
-WINDOW      = 1024
-STRIDE      = 128
+WINDOW      = args.window
+STRIDE      = args.stride
 
 print(f"Size of signal: {len(SIGNAL)}")
 print(f"Size of labels: {len(LABELS)}")
@@ -94,12 +125,12 @@ os.makedirs('outputs', exist_ok=True)
 
 
 with open('outputs/metrics.csv', 'w', newline='') as f:
-    csv.writer(f).writerow(['Fold', 'Best Epoch', 'Train Acc', 'Val Acc', 'Train Loss', 'Val Loss'])
+    csv.writer(f).writerow(['Fold', 'Best Epoch', 'Train Acc', 'Val Acc', 'Train Loss', 'Val Loss', 'Val Recall'])
 
 
 
 fold_number = 0
-for train_idx, test_idx in GroupKFold(n_splits=FOLD_SPLITS).split(SIGNAL, LABELS, GROUPS):
+for train_idx, test_idx in StratifiedGroupKFold(n_splits=FOLD_SPLITS, shuffle=True, random_state=args.random_seed).split(SIGNAL, LABELS, GROUPS):
     print(f"\n{'='*50}\nFold {fold_number}\n{'='*50}")
 
     X_train_raw = SIGNAL.iloc[train_idx]
@@ -138,6 +169,7 @@ for train_idx, test_idx in GroupKFold(n_splits=FOLD_SPLITS).split(SIGNAL, LABELS
     
     model = build_ecg_model(input_shape=(WINDOW, 1), n_classes=1)
 
+   
     callbacks = [
         EarlyStopping(
             monitor='val_loss',
@@ -152,19 +184,20 @@ for train_idx, test_idx in GroupKFold(n_splits=FOLD_SPLITS).split(SIGNAL, LABELS
             min_lr=1e-6,
             verbose=1
         ),
-        
         ModelCheckpoint(
             filepath=f'outputs/best_model_fold_{fold_number}.keras',
             monitor='val_loss',
             save_best_only=True,
             verbose=1
         ),
+        
+        MLflowFoldCallback(fold_num=fold_number)
     ]
 
     
     history = model.fit(
         X_train_w, y_train_w,
-        epochs=30,
+        epochs=args.epochs,
         validation_data=(X_test_w, y_test_w),
         class_weight=class_weight_dict,
         callbacks=callbacks,
@@ -177,18 +210,43 @@ for train_idx, test_idx in GroupKFold(n_splits=FOLD_SPLITS).split(SIGNAL, LABELS
     best_val_acc     = history.history['val_accuracy'][best_epoch]
     best_train_acc   = history.history['accuracy'][best_epoch]
     best_train_loss  = history.history['loss'][best_epoch]
+    best_val_recall  = history.history['val_recall'][best_epoch]
+
+    
+    y_pred = (model.predict(X_test_w) > 0.5).astype(int).flatten()
+    
+    cm = confusion_matrix(y_test_w, y_pred)
+    
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[0, 1])
+    disp.plot(cmap=plt.cm.Blues, ax=ax)
+    
+    plt.title(f'Confusion Matrix - Fold {fold_number}')
+    plt.savefig(f'outputs/confusion_matrix_fold_{fold_number}.png')
+    
+   
+    
+    
+  
+    plt.close(fig)
+
+    mlflow.log_metric(f"best_val_loss_fold_{fold_number}", best_val_loss)
+    mlflow.log_metric(f"best_val_acc_fold_{fold_number}", best_val_acc)
+    mlflow.log_metric(f"best_val_recall_fold_{fold_number}", best_val_recall)
 
     print(
         f"Fold {fold_number} | Best epoch: {best_epoch + 1} | "
         f"Train Acc={best_train_acc:.4f}, Loss={best_train_loss:.4f} | "
-        f"Val Acc={best_val_acc:.4f}, Val Loss={best_val_loss:.4f}"
+        f"Val Acc={best_val_acc:.4f}, Val Loss={best_val_loss:.4f}, Val Recall={best_val_recall:.4f}"
     )
 
     with open('outputs/metrics.csv', 'a', newline='') as f:
         csv.writer(f).writerow([
             fold_number, best_epoch + 1,
             best_train_acc, best_val_acc,
-            best_train_loss, best_val_loss
+            best_train_loss, best_val_loss,
+            best_val_recall
         ])
 
     plot_loss(history, fold_number)
@@ -199,6 +257,17 @@ metrics_df = pd.read_csv('outputs/metrics.csv')
 best_fold  = int(metrics_df.loc[metrics_df['Val Loss'].idxmin(), 'Fold'])
 best_val   = metrics_df['Val Loss'].min()
 
+
+mean_val_loss = metrics_df['Val Loss'].mean()
+mean_val_acc = metrics_df['Val Acc'].mean()
+mean_val_recall = metrics_df['Val Recall'].mean()
+
+mlflow.log_metric("cv_mean_val_loss", mean_val_loss)
+mlflow.log_metric("cv_mean_val_acc", mean_val_acc)
+mlflow.log_metric("best_fold_number", best_fold)
+mlflow.log_metric("cv_mean_val_recall", mean_val_recall)
+
+
 shutil.copy(
     f'outputs/best_model_fold_{best_fold}.keras',
     'outputs/best_overall_model.keras'
@@ -206,3 +275,4 @@ shutil.copy(
 print(f"\n{'='*50}")
 print(f"Best fold: {best_fold} | Val Loss: {best_val:.4f}")
 print(f"Saved: outputs/best_overall_model.keras")
+

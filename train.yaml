@@ -1,0 +1,45 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandComponent.schema.json
+name: ecg_training_component
+display_name: Train ECG Anomaly Model
+version: 1.0.0
+type: command
+
+
+inputs:
+  data_dir: 
+    type: uri_folder
+    description: "Path to raw ECG data folder"
+  selected_samples:
+    type: integer
+    default: 20
+    description: "Number of ECG records to load"
+  window:
+    type: integer
+    default: 1024
+    description: "Sliding window size"
+  stride:
+    type: integer
+    default: 256
+    description: "Stride size for sliding window"
+  epochs:
+    type: integer
+    default: 30
+    description: "Number of training epochs"
+
+
+code: ./src
+
+
+environment:
+  name: ecg-training-env
+  image: mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu20.04:latest
+  conda_file: ./conda.yml
+
+
+command: >-
+  python train.py 
+  --data-dir ${{inputs.data_dir}} 
+  --selected-samples ${{inputs.selected_samples}} 
+  --window ${{inputs.window}} 
+  --stride ${{inputs.stride}} 
+  --epochs ${{inputs.epochs}}

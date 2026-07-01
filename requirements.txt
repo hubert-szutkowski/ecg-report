@@ -1,0 +1,11 @@
+tensorflow
+scikit-learn
+pandas
+numpy
+wfdb
+matplotlib
+joblib
+mlflow
+azureml-mlflow
+azure-ai-ml
+azure-identity
