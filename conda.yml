@@ -6,6 +6,7 @@ dependencies:
   - python=3.10
   - pip
   - pip:
+    - azureml-inference-server-http
     - tensorflow==2.21.0
     - scikit-learn
     - pandas
