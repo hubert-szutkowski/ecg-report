@@ -44,20 +44,22 @@ def run(raw_data):
         input_tensor = signal.reshape(1, 1024, 1).astype(np.float32)
         
         # 4. Prediction
-        prediction_prob = float(model.predict(input_tensor)[0][0])
-        # Determine if the signal is normal or anomalous based on the prediction probability
-        is_normal = True if prediction_prob > 0.5 else False
-        is_anomaly_bool = not is_normal
         
-      
-        anomaly_probability = 1.0 - prediction_prob if is_normal else prediction_prob
-        
+        # Surowy wynik z modelu to prawdopodobieństwo klasy 0 (Normal)
+        normal_prob = float(model.predict(input_tensor)[0][0])
+
+        # Obliczamy prawdopodobieństwo anomalii (klasy 1)
+        anomaly_prob = 1.0 - normal_prob
+
+        # Próg klasyfikacji ustawiony na szansę wystąpienia anomalii
+        is_anomaly = 1 if anomaly_prob > 0.5 else 0
+
         return {
             "Record_Id": record_id,
             "Okno": okno,
-            "Prediction": "Anomaly" if is_anomaly_bool else "Normal",
-            "Probability": round(anomaly_probability, 4),
-            "Is_Anomaly": 1 if is_anomaly_bool else 0
+            "Prediction": "Anomaly" if is_anomaly == 1 else "Normal",
+            "Probability": round(anomaly_prob, 4), # Wysyłamy do Power BI szansę na anomalię
+            "Is_Anomaly": is_anomaly
         }
         
     except Exception as e:
