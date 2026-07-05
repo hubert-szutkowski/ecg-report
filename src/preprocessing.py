@@ -5,7 +5,7 @@ import numpy as np
 from pathlib import Path
 
 
-NORMAL_SYMBOL = 'N'
+NORMAL_SYMBOLS = {'N', '/', 'f', '', ' ', '"'}
 
 
 def get_record_ids(data_dir: str) -> list:
@@ -48,7 +48,7 @@ def get_record(dir_path: str, sample_select: int = 0) -> pd.DataFrame:
     labels = np.zeros(n_samples, dtype=int)
 
     for i, (sample_pos, symbol) in enumerate(zip(features_samples, features)):
-        label_value = 0 if symbol == NORMAL_SYMBOL else 1
+        label_value = 0 if symbol in NORMAL_SYMBOLS else 1
 
         start = sample_pos
         end   = features_samples[i + 1] if i + 1 < len(features_samples) else n_samples
