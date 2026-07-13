@@ -9,3 +9,4 @@ mlflow
 azureml-mlflow
 azure-ai-ml
 azure-identity
+pytest
