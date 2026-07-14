@@ -4,6 +4,7 @@ from azure.ai.ml import MLClient
 from azure.ai.ml.entities import Model
 from azure.ai.ml.constants import AssetTypes
 from azure.identity import DefaultAzureCredential
+import sys
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Challenger model against the registered Champion")
@@ -87,8 +88,10 @@ def main():
         
         ml_client.models.create_or_update(new_champion)
         print(f"SUCCESS: Registered new Champion version with {args.metric_name}: {challenger_score:.4f}")
+        sys.exit(0)
     else:
         print(f"REJECTED: Challenger score ({challenger_score:.4f}) did not beat Champion score ({best_registered_score:.4f}).")
+        sys.exit(2)
 
 if __name__ == "__main__":
     main()
