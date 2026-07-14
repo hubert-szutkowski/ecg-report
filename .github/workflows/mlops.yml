@@ -30,26 +30,26 @@ jobs:
       - name: Run preprocessing unit tests
         run: pytest tests/
 
-  # CT: CONTINUOUS TRAINING
-  train_model:
-    needs: test_pipeline 
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+  # # CT: CONTINUOUS TRAINING
+  # train_model:
+  #   needs: test_pipeline 
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v3
 
-      - name: Setup Python 3.10
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
+  #     - name: Setup Python 3.10
+  #       uses: actions/setup-python@v4
+  #       with:
+  #         python-version: '3.10'
 
-      - name: Azure Login
-        uses: azure/login@v1
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+  #     - name: Azure Login
+  #       uses: azure/login@v1
+  #       with:
+  #         creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Install Azure ML SDK
-        run: pip install azure-ai-ml azure-identity
+  #     - name: Install Azure ML SDK
+  #       run: pip install azure-ai-ml azure-identity
 
-      - name: Submit Training Job to Azure ML Cluster
-        run: python submit_job.py --task multiclass
+  #     - name: Submit Training Job to Azure ML Cluster
+  #       run: python submit_job.py --task multiclass
