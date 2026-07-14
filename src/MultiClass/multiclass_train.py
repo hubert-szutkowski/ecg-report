@@ -20,6 +20,7 @@ from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from tensorflow.keras.utils import to_categorical
+import mlflow.keras
 
 
 parser = argparse.ArgumentParser(description="ECG Multiclass Training Pipeline")
@@ -222,6 +223,10 @@ mlflow.log_metric("best_fold_number", best_fold)
 
 shutil.copy(f'outputs/best_model_fold_{best_fold}.keras', 'outputs/best_overall_multiclass_model.keras')
 shutil.copy(f'outputs/scaler_fold_{best_fold}.pkl', 'outputs/best_overall_scaler.pkl')
+
+os.makedirs("./outputs", exist_ok=True)
+model.save("./outputs/ecg_multiclass_model.keras")
+print("Model saved successfully to ./outputs/ecg_multiclass_model.keras")
 
 print(f"\n{'='*50}")
 print(f"MULTICLASS TRAINING COMPLETE")
