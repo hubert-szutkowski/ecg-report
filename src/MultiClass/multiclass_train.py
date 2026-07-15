@@ -17,7 +17,7 @@ from multiclass_model import build_ecg_multiclass_model
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.utils.class_weight import compute_class_weight
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, roc_auc_score
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from tensorflow.keras.utils import to_categorical
 import mlflow.keras
@@ -141,12 +141,17 @@ for train_idx, test_idx in sgkf.split(X_DATA, Y_ENCODED, GROUPS):
     y_train_cat = to_categorical(y_train_raw, num_classes=NUM_CLASSES)
     y_test_cat  = to_categorical(y_test_raw, num_classes=NUM_CLASSES)
 
-
     class_weights = compute_class_weight('balanced', classes=np.unique(y_train_raw), y=y_train_raw)
     class_weight_dict = dict(enumerate(class_weights))
     print(f"Computed Multiclass Weights: {class_weight_dict}")
 
     model = build_ecg_multiclass_model(input_shape=(args.window, 1), n_classes=NUM_CLASSES)
+
+    model.compile(
+        optimizer='adam',
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
 
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
@@ -169,12 +174,25 @@ for train_idx, test_idx in sgkf.split(X_DATA, Y_ENCODED, GROUPS):
     best_val_acc    = history.history['val_accuracy'][best_epoch]
     best_train_acc  = history.history['accuracy'][best_epoch]
     best_train_loss = history.history['loss'][best_epoch]
-    best_val_auc    = history.history['val_auc_ovr'][best_epoch]
 
     
     y_pred_probs = model.predict(X_test_w)
     y_pred = np.argmax(y_pred_probs, axis=1)
     
+    y_pred_probs = model.predict(X_test_w)
+    y_pred = np.argmax(y_pred_probs, axis=1)
+    
+    try:
+        present_classes = np.any(y_test_cat > 0, axis=0)
+        best_val_auc = roc_auc_score(
+            y_test_cat[:, present_classes],
+            y_pred_probs[:, present_classes],
+            multi_class='ovr',
+            average='weighted'
+        )
+    except Exception as e:
+        print(f"Warning: Failed to calculate weighted AUC for fold {fold_number}: {e}")
+        best_val_auc = 0.5  
     
     cm = confusion_matrix(y_test_raw, y_pred, labels=range(NUM_CLASSES))
 

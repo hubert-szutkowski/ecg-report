@@ -99,15 +99,5 @@ def build_ecg_multiclass_model(input_shape: tuple, n_classes: int) -> tf.keras.M
     # 10. Model Compilation
     model = Model(inputs=inputs, outputs=outputs)
     
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
-        loss='categorical_crossentropy',  
-        metrics=[
-            'accuracy',
-            # One-vs-Rest AUC for one-hot encoded multiclass targets
-            tf.keras.metrics.AUC(multi_label=True, num_labels=n_classes, name='auc_ovr'),
-        ]
-    )
-    
     model.summary()
     return model
