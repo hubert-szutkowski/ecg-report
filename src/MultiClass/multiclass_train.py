@@ -17,7 +17,7 @@ from multiclass_model import build_ecg_multiclass_model
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.utils.class_weight import compute_class_weight
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, roc_auc_score
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, roc_auc_score, classification_report
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from tensorflow.keras.utils import to_categorical
 import mlflow.keras
@@ -204,6 +204,25 @@ for train_idx, test_idx in sgkf.split(X_DATA, Y_ENCODED, GROUPS):
     plt.tight_layout()
     plt.savefig(f'outputs/confusion_matrix_fold_{fold_number}.png')
     plt.close(fig)
+
+    report_text = classification_report(
+        y_test_raw, 
+        y_pred, 
+        target_names=encoder.classes_, 
+        zero_division=0 
+    )
+    
+    print(f"\nDetailed Classification Report (Fold {fold_number}):\n")
+    print(report_text)
+    
+    
+    report_path = f'outputs/classification_report_fold_{fold_number}.txt'
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write(f"Detailed Classification Report - Fold {fold_number} ===\n\n")
+        f.write(report_text)
+        
+    
+    mlflow.log_artifact(report_path)
 
    
     mlflow.log_metric(f"best_val_loss_fold_{fold_number}", best_val_loss)
