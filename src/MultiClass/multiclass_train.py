@@ -68,36 +68,58 @@ def plot_loss(history, fold_number):
     plt.close()  
 
 
-def load_all_multiclass_data(data_dir: str, num_records: int):
+def load_all_multiclass_data(data_dir: str, num_records: int, random_seed: int):
     """
-    Loops through the specified number of records using get_multiclass_data
-    and generates the corresponding groups array for cross-validation.
-    """
-    X_all = []
-    y_all = []
-    groups_all = []
-    
+    Loads all ECG signal windows and their corresponding labels from the specified directory.
+    Applies dynamic downsampling based on interquartile range (IQR) to balance the dataset across different classes and patients.
+    """ 
+    X_all, y_all, groups_all = [], [], []
     record_ids = get_record_ids(data_dir)
     records_to_process = min(num_records, len(record_ids))
     
-    print(f"\nExtracting anomaly windows from {records_to_process} records...")
-    
     for i in range(records_to_process):
         X_record, y_record = get_multiclass_data(data_dir, sample_select=i)
-        record_id = record_ids[i]
-        
         if len(X_record) > 0:
             X_all.append(X_record)
             y_all.append(y_record)
-            groups_all.extend([record_id] * len(X_record))
+            groups_all.extend([record_ids[i]] * len(X_record))
             
     X_master = np.vstack(X_all) if X_all else np.array([])
     y_master = np.concatenate(y_all) if y_all else np.array([])
     groups_master = np.array(groups_all)
     
-    return X_master, y_master, groups_master
+    if len(y_master) == 0:
+        return X_master, y_master, groups_master
 
-X_DATA, Y_LABELS, GROUPS = load_all_multiclass_data(args.data_dir, args.selected_samples)
+    #Dynamic downsampling based on IQR to handle class imbalance and patient-level outliers
+    rng = np.random.default_rng(random_seed)
+    valid_indices = []
+    
+    for cls in np.unique(y_master):
+        cls_mask = (y_master == cls)
+        patients_with_cls = groups_master[cls_mask]
+
+        unique_patients, counts = np.unique(patients_with_cls, return_counts=True)
+        
+        q1 = np.percentile(counts, 25)
+        q3 = np.percentile(counts, 75)
+        iqr = q3 - q1
+        
+        dynamic_limit = int(np.ceil(q3 + 1.5 * iqr))
+        dynamic_limit = max(dynamic_limit, 30) 
+        
+        for patient in unique_patients:
+            patient_cls_idx = np.where((y_master == cls) & (groups_master == patient))[0]
+            
+            if len(patient_cls_idx) > dynamic_limit:
+                patient_cls_idx = rng.choice(patient_cls_idx, size=dynamic_limit, replace=False)
+                
+            valid_indices.extend(patient_cls_idx)
+
+    valid_indices = np.sort(valid_indices)
+    return X_master[valid_indices], y_master[valid_indices], groups_master[valid_indices]
+
+X_DATA, Y_LABELS, GROUPS = load_all_multiclass_data(args.data_dir, args.selected_samples, args.random_seed)
 os.makedirs('outputs', exist_ok=True)
 
 encoder = LabelEncoder()
@@ -208,7 +230,8 @@ for train_idx, test_idx in sgkf.split(X_DATA, Y_ENCODED, GROUPS):
     report_text = classification_report(
         y_test_raw, 
         y_pred, 
-        target_names=encoder.classes_, 
+        labels=range(NUM_CLASSES),
+        target_names=list(encoder.classes_), 
         zero_division=0 
     )
     
@@ -222,7 +245,7 @@ for train_idx, test_idx in sgkf.split(X_DATA, Y_ENCODED, GROUPS):
         f.write(report_text)
         
     
-    mlflow.log_artifact(report_path)
+    
 
    
     mlflow.log_metric(f"best_val_loss_fold_{fold_number}", best_val_loss)
