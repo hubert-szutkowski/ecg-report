@@ -12,7 +12,7 @@ import tensorflow as tf
 
 
 from multiclass_preprocessing import get_record_ids, get_multiclass_data
-from multiclass_model import build_ecg_multiclass_model 
+from multiclass_model import build_inception_conformer
 
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler, LabelEncoder
@@ -30,7 +30,6 @@ parser.add_argument("--window", type=int, default=400, help="Fixed window size a
 parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
 parser.add_argument("--batch-size", type=int, default=64, help="Batch size for training")
 parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
-
 args = parser.parse_args()
 
 
@@ -169,7 +168,7 @@ for train_idx, test_idx in sgkf.split(X_DATA, Y_ENCODED, GROUPS):
     class_weight_dict = dict(enumerate(class_weights))
     print(f"Computed Multiclass Weights: {class_weight_dict}")
 
-    model = build_ecg_multiclass_model(input_shape=(args.window, 1), n_classes=NUM_CLASSES)
+    model = build_inception_conformer(input_shape=(args.window, 1), n_classes=NUM_CLASSES)
     #For Cosine Decay
     steps_per_epoch = len(X_train_w) // args.batch_size
     total_steps = steps_per_epoch * args.epochs
@@ -193,7 +192,7 @@ for train_idx, test_idx in sgkf.split(X_DATA, Y_ENCODED, GROUPS):
     )
 
     callbacks = [
-        EarlyStopping(monitor='val_loss', patience=5, min_delta=1e-4, restore_best_weights=True, verbose=1),
+        EarlyStopping(monitor='val_loss', patience=15, min_delta=1e-4, restore_best_weights=True, verbose=1),
         # ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-6, verbose=1),
         ModelCheckpoint(filepath=f'outputs/best_model_fold_{fold_number}.keras', monitor='val_loss', save_best_only=True, verbose=1),
         MLflowFoldCallback(fold_num=fold_number)
