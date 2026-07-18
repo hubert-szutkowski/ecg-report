@@ -28,6 +28,7 @@ parser.add_argument("--data-dir", type=str, required=True, help="Path to raw ECG
 parser.add_argument("--selected-samples", type=int, default=20, help="Number of ECG records to load")
 parser.add_argument("--window", type=int, default=400, help="Fixed window size around the R-peak") 
 parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
+parser.add_argument("--batch-size", type=int, default=32, help="Batch size for training")
 parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
 
 args = parser.parse_args()
@@ -38,6 +39,7 @@ mlflow.log_params({
     "epochs": args.epochs,
     "selected_samples": args.selected_samples,
     "random_seed": args.random_seed,
+    "batch_size": args.batch_size,
     "model_type": "Multiclass_1D_CNN"
 })
 
@@ -168,16 +170,31 @@ for train_idx, test_idx in sgkf.split(X_DATA, Y_ENCODED, GROUPS):
     print(f"Computed Multiclass Weights: {class_weight_dict}")
 
     model = build_ecg_multiclass_model(input_shape=(args.window, 1), n_classes=NUM_CLASSES)
+    #For Cosine Decay
+    steps_per_epoch = len(X_train_w) // args.batch_size
+    total_steps = steps_per_epoch * args.epochs
+
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=5e-4, 
+        decay_steps=total_steps,
+        alpha=0.01                  
+    )
+
+    focal_loss = tf.keras.losses.CategoricalFocalCrossentropy(
+        alpha=0.25,
+        gamma=1.5,
+        label_smoothing=0.0
+    )
 
     model.compile(
-        optimizer='adam',
-        loss='categorical_crossentropy',
+        optimizer=tf.keras.optimizers.Adam(learning_rate=lr_schedule, clipnorm=1.0),
+        loss=focal_loss,
         metrics=['accuracy']
     )
 
     callbacks = [
-        EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-6, verbose=1),
+        EarlyStopping(monitor='val_loss', patience=10, min_delta=1e-4, restore_best_weights=True, verbose=1),
+        # ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-6, verbose=1),
         ModelCheckpoint(filepath=f'outputs/best_model_fold_{fold_number}.keras', monitor='val_loss', save_best_only=True, verbose=1),
         MLflowFoldCallback(fold_num=fold_number)
     ]

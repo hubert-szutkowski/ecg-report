@@ -4,7 +4,7 @@ from tensorflow.keras.layers import (
     Input, Conv1D, MaxPooling1D,
     BatchNormalization, Activation,
     GlobalAveragePooling1D, Dropout, Dense,
-    Concatenate, Add, GaussianNoise
+    Concatenate, Add, GaussianNoise, SpatialDropout1D
 )
 from tensorflow.keras.regularizers import l2
 
@@ -54,13 +54,13 @@ def build_ecg_multiclass_model(input_shape: tuple, n_classes: int) -> tf.keras.M
     inputs = Input(shape=input_shape)
     
     # 2. Input Regularization (Gaussian Noise for robustness against electrode movement)
-    x = GaussianNoise(0.05)(inputs)
+    x = GaussianNoise(0.1)(inputs)
     
     # 3. Initial Convolution (Stem) to extract low-level features before the Inception blocks
     x = Conv1D(filters=32, kernel_size=16, padding='same', use_bias=False)(x)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
-    
+    x = SpatialDropout1D(0.3)(x)
     # Store the input of the Inception block for the Residual Connection (Skip Connection)
     res_input = x 
     
@@ -85,6 +85,8 @@ def build_ecg_multiclass_model(input_shape: tuple, n_classes: int) -> tf.keras.M
     res_input = BatchNormalization()(res_input)
     x = Add()([x, res_input])
     x = Activation('relu')(x)
+
+    x = SpatialDropout1D(0.2)(x)
     
     # 7. Global Average Pooling (drastically reduces parameters compared to Flatten)
     x = GlobalAveragePooling1D()(x)
