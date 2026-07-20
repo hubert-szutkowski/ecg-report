@@ -12,8 +12,8 @@ import tensorflow as tf
 
 
 from multiclass_preprocessing import get_record_ids, get_multiclass_data
-from multiclass_model import build_ecg_multiclass_model 
-
+from multiclass_model import build_inception_conformer
+from data_augment import augment_ecg
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.utils.class_weight import compute_class_weight
@@ -28,9 +28,9 @@ parser.add_argument("--data-dir", type=str, required=True, help="Path to raw ECG
 parser.add_argument("--selected-samples", type=int, default=20, help="Number of ECG records to load")
 parser.add_argument("--window", type=int, default=400, help="Fixed window size around the R-peak") 
 parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
-parser.add_argument("--batch-size", type=int, default=64, help="Batch size for training")
+parser.add_argument("--batch-size", type=int, default=128, help="Batch size for training")
 parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
-
+parser.add_argument("--start_learning_rate", type=float, default=1.5e-3, help="Initial learning rate for the optimizer")
 args = parser.parse_args()
 
 
@@ -122,6 +122,9 @@ def load_all_multiclass_data(data_dir: str, num_records: int, random_seed: int):
     return X_master[valid_indices], y_master[valid_indices], groups_master[valid_indices]
 
 X_DATA, Y_LABELS, GROUPS = load_all_multiclass_data(args.data_dir, args.selected_samples, args.random_seed)
+
+X_DATA = X_DATA.astype(np.float32)
+
 os.makedirs('outputs', exist_ok=True)
 
 encoder = LabelEncoder()
@@ -135,7 +138,7 @@ print(f"Detected {NUM_CLASSES} distinct anomaly classes: {encoder.classes_}")
 print(f"Class distribution: {np.bincount(Y_ENCODED)}")
 
 with open('outputs/metrics.csv', 'w', newline='') as f:
-    csv.writer(f).writerow(['Fold', 'Best Epoch', 'Train Acc', 'Val Acc', 'Train Loss', 'Val Loss', 'Val AUC'])
+    csv.writer(f).writerow(['Fold', 'Best Epoch', 'Train Acc', 'Val Acc', 'Train Loss', 'Val Loss', 'Val AUC', 'F1 Score'])
 
 FOLD_SPLITS = 5
 fold_number = 0
@@ -169,41 +172,59 @@ for train_idx, test_idx in sgkf.split(X_DATA, Y_ENCODED, GROUPS):
     class_weight_dict = dict(enumerate(class_weights))
     print(f"Computed Multiclass Weights: {class_weight_dict}")
 
-    model = build_ecg_multiclass_model(input_shape=(args.window, 1), n_classes=NUM_CLASSES)
+    model = build_inception_conformer(input_shape=(args.window, 1), n_classes=NUM_CLASSES)
     #For Cosine Decay
     steps_per_epoch = len(X_train_w) // args.batch_size
     total_steps = steps_per_epoch * args.epochs
 
+    warmup_steps = int(0.1 * total_steps)
+
     lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=5e-4, 
-        decay_steps=total_steps,
-        alpha=0.01                  
+        initial_learning_rate=args.start_learning_rate, 
+        decay_steps=total_steps - warmup_steps,
+        alpha=0.01,
+        warmup_target=args.start_learning_rate,
+        warmup_steps=warmup_steps                  
     )
 
     focal_loss = tf.keras.losses.CategoricalFocalCrossentropy(
         alpha=0.25,
-        gamma=1.5,
-        label_smoothing=0.0
+        gamma=1,
+        label_smoothing=0.05
     )
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=lr_schedule, clipnorm=1.0),
+        optimizer=tf.keras.optimizers.AdamW(learning_rate=lr_schedule, clipnorm=1.0, weight_decay=1e-2),
         loss=focal_loss,
-        metrics=['accuracy']
+        metrics=['accuracy', tf.keras.metrics.F1Score(average='macro', name='macro_f1'),]
     )
 
     callbacks = [
-        EarlyStopping(monitor='val_loss', patience=5, min_delta=1e-4, restore_best_weights=True, verbose=1),
+        EarlyStopping(monitor='val_loss', patience=10, min_delta=1e-4, restore_best_weights=True, verbose=1),
         # ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-6, verbose=1),
         ModelCheckpoint(filepath=f'outputs/best_model_fold_{fold_number}.keras', monitor='val_loss', save_best_only=True, verbose=1),
         MLflowFoldCallback(fold_num=fold_number)
     ]
     
+    train_dataset = (
+        tf.data.Dataset.from_tensor_slices((X_train_w, y_train_cat))
+        .shuffle(buffer_size=1024)
+        .map(augment_ecg, num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(args.batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    val_dataset = (
+        tf.data.Dataset.from_tensor_slices((X_test_w, y_test_cat))
+        .batch(args.batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
     history = model.fit(
-        X_train_w, y_train_cat,
+        train_dataset,
         epochs=args.epochs,
-        validation_data=(X_test_w, y_test_cat),
-        class_weight=class_weight_dict,
+        validation_data=val_dataset,
+        #class_weight=class_weight_dict,
         callbacks=callbacks,
         verbose=1
     )
@@ -213,6 +234,7 @@ for train_idx, test_idx in sgkf.split(X_DATA, Y_ENCODED, GROUPS):
     best_val_acc    = history.history['val_accuracy'][best_epoch]
     best_train_acc  = history.history['accuracy'][best_epoch]
     best_train_loss = history.history['loss'][best_epoch]
+    best_f1_score   = history.history['macro_f1'][best_epoch]
 
     
     y_pred_probs = model.predict(X_test_w)
@@ -268,17 +290,18 @@ for train_idx, test_idx in sgkf.split(X_DATA, Y_ENCODED, GROUPS):
     mlflow.log_metric(f"best_val_loss_fold_{fold_number}", best_val_loss)
     mlflow.log_metric(f"best_val_acc_fold_{fold_number}", best_val_acc)
     mlflow.log_metric(f"best_val_auc_fold_{fold_number}", best_val_auc)
+    mlflow.log_metric(f"best_f1_score_fold_{fold_number}", best_f1_score)
 
     print(f"Fold {fold_number} | Best epoch: {best_epoch + 1} | "
           f"Train Acc={best_train_acc:.4f}, Loss={best_train_loss:.4f} | "
-          f"Val Acc={best_val_acc:.4f}, Val Loss={best_val_loss:.4f}, Val AUC={best_val_auc:.4f}")
+          f"Val Acc={best_val_acc:.4f}, Val Loss={best_val_loss:.4f}, Val AUC={best_val_auc:.4f}, F1 Score={best_f1_score:.4f}")
 
     with open('outputs/metrics.csv', 'a', newline='') as f:
         csv.writer(f).writerow([
             fold_number, best_epoch + 1,
             best_train_acc, best_val_acc,
             best_train_loss, best_val_loss,
-            best_val_auc
+            best_val_auc, best_f1_score
         ])
 
     plot_loss(history, fold_number)
@@ -292,10 +315,12 @@ best_val   = metrics_df['Val Loss'].min()
 mean_val_loss = metrics_df['Val Loss'].mean()
 mean_val_acc = metrics_df['Val Acc'].mean()
 mean_val_auc = metrics_df['Val AUC'].mean()
+mean_f1_score = metrics_df['F1 Score'].mean()
 
 mlflow.log_metric("cv_mean_val_loss", mean_val_loss)
 mlflow.log_metric("cv_mean_val_acc", mean_val_acc)
 mlflow.log_metric("cv_mean_val_auc", mean_val_auc)
+mlflow.log_metric("cv_mean_f1_score", mean_f1_score)
 mlflow.log_metric("best_fold_number", best_fold)
 
 shutil.copy(f'outputs/best_model_fold_{best_fold}.keras', 'outputs/best_overall_multiclass_model.keras')
@@ -307,7 +332,7 @@ print("Model saved successfully to ./outputs/ecg_multiclass_model.keras")
 
 print(f"\n{'='*50}")
 print(f"MULTICLASS TRAINING COMPLETE")
-print(f"Mean CV Accuracy: {mean_val_acc:.4f} | Mean CV AUC (OVR): {mean_val_auc:.4f}")
+print(f"Mean CV Accuracy: {mean_val_acc:.4f} | Mean CV AUC (OVR): {mean_val_auc:.4f} | Mean CV F1 Score: {mean_f1_score:.4f}")
 print(f"Best fold: {best_fold} | Val Loss: {best_val:.4f}")
 print(f"Saved best model: outputs/best_overall_multiclass_model.keras")
 print(f"Saved Label Encoder: outputs/label_encoder.pkl")

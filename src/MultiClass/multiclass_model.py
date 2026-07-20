@@ -1,105 +1,92 @@
 import tensorflow as tf
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import (
-    Input, Conv1D, MaxPooling1D,
-    BatchNormalization, Activation,
-    GlobalAveragePooling1D, Dropout, Dense,
-    Concatenate, Add, GaussianNoise, SpatialDropout1D
-)
-from tensorflow.keras.regularizers import l2
+from tensorflow.keras import layers, Model, regularizers
 
-def inception_module(input_tensor, filters: int):
-    """
-    Core Inception-1D block. 
-    Processes the ECG signal through multiple kernel sizes simultaneously 
-    to capture both short (high-frequency) and long (low-frequency) morphological features.
-    """
-    # Branch 1: Short kernel for sharp peaks (e.g., PACs, artifacts)
-    conv_1 = Conv1D(filters=filters, kernel_size=10, padding='same', 
-                    activation='relu', use_bias=False)(input_tensor)
-    
-    # Branch 2: Medium kernel for standard wave components (e.g., normal QRS)
-    conv_2 = Conv1D(filters=filters, kernel_size=20, padding='same', 
-                    activation='relu', use_bias=False)(input_tensor)
-    
-    # Branch 3: Long kernel for wide, slow waves (e.g., PVCs, T-waves)
-    conv_3 = Conv1D(filters=filters, kernel_size=40, padding='same', 
-                    activation='relu', use_bias=False)(input_tensor)
-    
-    # Branch 4: MaxPooling followed by 1x1 Conv to preserve baseline spatial data
-    pool = MaxPooling1D(pool_size=3, strides=1, padding='same')(input_tensor)
-    conv_4 = Conv1D(filters=filters, kernel_size=1, padding='same', 
-                    activation='relu', use_bias=False)(pool)
-    
-    # Concatenate all branches along the channel axis
-    merged = Concatenate(axis=-1)([conv_1, conv_2, conv_3, conv_4])
-    merged = BatchNormalization()(merged)
-    merged = Activation('relu')(merged)
-    
-    return merged
 
-def build_ecg_multiclass_model(input_shape: tuple, n_classes: int) -> tf.keras.Model:
+class PositionalEmbedding(layers.Layer):
     """
-    Building a robust InceptionTime-1D model for multiclass ECG classification.
-    
+    Layer that adds positional embeddings to the input tensor. This is useful for models that need to capture the order of elements in a sequence, such as transformers.
     Parameters:
-        input_shape (tuple): Shape of the input data (e.g., (400, 1)).
-        n_classes (int): Number of output anomaly classes.
-        
+        sequence_length (int): The length of the input sequences.
+        output_dim (int): The dimensionality of the positional embeddings.
     Returns:
-        tf.keras.Model: Compiled Keras Functional API model.
+        tf.Tensor: The input tensor with added positional embeddings.
     """
-    
-    # 1. Input Definition
-    inputs = Input(shape=input_shape)
-    
-    # 2. Input Regularization (Gaussian Noise for robustness against electrode movement)
-    x = GaussianNoise(0.1)(inputs)
-    
-    # 3. Initial Convolution (Stem) to extract low-level features before the Inception blocks
-    x = Conv1D(filters=32, kernel_size=16, padding='same', use_bias=False)(x)
-    x = BatchNormalization()(x)
-    x = Activation('relu')(x)
-    x = SpatialDropout1D(0.3)(x)
-    # Store the input of the Inception block for the Residual Connection (Skip Connection)
-    res_input = x 
-    
-    # 4. First Inception Block
-    x = inception_module(x, filters=32)
-    
-    # 5. Skip Connection matching dimensions via 1x1 Convolution
-    # This prevents the vanishing gradient problem in deep medical networks
-    res_input = Conv1D(filters=x.shape[-1], kernel_size=1, padding='same', use_bias=False)(res_input)
-    res_input = BatchNormalization()(res_input)
-    x = Add()([x, res_input])
-    x = Activation('relu')(x)
-    
-    # Max Pooling to compress time dimension
-    x = MaxPooling1D(pool_size=4)(x)
-    
-    # 6. Second Inception Block (Deeper feature extraction)
-    res_input = x 
-    x = inception_module(x, filters=64)
-    
-    res_input = Conv1D(filters=x.shape[-1], kernel_size=1, padding='same', use_bias=False)(res_input)
-    res_input = BatchNormalization()(res_input)
-    x = Add()([x, res_input])
-    x = Activation('relu')(x)
+    def __init__(self, sequence_length, output_dim, **kwargs):
+        super().__init__(**kwargs)
+        self.position_embeddings = layers.Embedding(
+            input_dim=sequence_length, output_dim=output_dim
+        )
+        self.sequence_length = sequence_length
 
-    x = SpatialDropout1D(0.2)(x)
+    def call(self, inputs):
+        # Generating a range of positions for the input sequence
+        positions = tf.range(start=0, limit=self.sequence_length, delta=1)
+        # Changing the shape of positions to match the input tensor's batch size
+        embedded_positions = self.position_embeddings(positions)
+        return inputs + embedded_positions
+
+
+def inception_module(input_tensor, filters=32):
+    """
+    Inception module for 1D signals. It consists of multiple convolutional branches with different kernel sizes and a pooling branch, which are then concatenated together.
+    Parameters:
+        input_tensor (tf.Tensor): Input tensor to the inception module.
+        filters (int): Number of filters for each convolutional branch.
+    Returns:
+        tf.Tensor: Output tensor after applying the inception module.
+    """
+    #Branch 1: short signals (e.g., P wave)
+    conv1 = layers.Conv1D(filters, kernel_size=9, padding='same', activation='relu',)(input_tensor)
     
-    # 7. Global Average Pooling (drastically reduces parameters compared to Flatten)
-    x = GlobalAveragePooling1D()(x)
+    # Branch 2: Medium signals (e.g., QRS complex)
+    conv2 = layers.Conv1D(filters, kernel_size=19, padding='same', activation='relu')(input_tensor)
     
-    # 8. Fully Connected Layer with strong L2 regularization and Dropout
-    x = Dense(128, activation='relu', kernel_regularizer=l2(1e-3))(x)
-    x = Dropout(0.5)(x)
+    # Branch 3: Long signals (e.g., T or U wave)
+    conv3 = layers.Conv1D(filters, kernel_size=39, padding='same', activation='relu')(input_tensor)
     
-    # 9. Output Layer for Multiclass (Softmax)
-    outputs = Dense(n_classes, activation='softmax')(x)
+    # Branch 4: Pooling
+    pool = layers.MaxPooling1D(pool_size=3, strides=1, padding='same')(input_tensor)
+    conv4 = layers.Conv1D(filters, kernel_size=1, padding='same', activation='relu')(pool)
     
-    # 10. Model Compilation
-    model = Model(inputs=inputs, outputs=outputs)
+    # Merging all branches
+    out = layers.Concatenate(axis=-1)([conv1, conv2, conv3, conv4])
+    out = layers.BatchNormalization()(out)
+    out = layers.SpatialDropout1D(0.25)(out)
+    return out
+
+def build_inception_conformer(input_shape=(400, 1), n_classes=18):
+    inputs = layers.Input(shape=input_shape)
     
-    model.summary()
+    
+    #INCEPTION (Morphological feature extraction)
+    
+    x = inception_module(inputs, filters=32)
+    x = layers.MaxPooling1D(pool_size=2)(x) # Reduction to 200 samples
+    
+    x = inception_module(x, filters=32)
+    x = layers.MaxPooling1D(pool_size=2)(x) # Reduction to 100 samples
+    
+    # TRANSFORMER (Time-series modeling)
+    x = PositionalEmbedding(sequence_length=100, output_dim=128)(x)
+
+    x_norm = layers.LayerNormalization(epsilon=1e-6)(x)
+    attention_output = layers.MultiHeadAttention(num_heads=4, key_dim=64, dropout=0.3)(x_norm, x_norm)
+    x = layers.Add()([x, attention_output])
+
+    x_norm2 = layers.LayerNormalization(epsilon=1e-6)(x)
+
+    ffn_output = layers.Dense(64, activation='relu')(x_norm2)
+    ffn_output = layers.Dropout(0.3)(ffn_output)
+    ffn_output = layers.Dense(128)(ffn_output)
+    
+    x = layers.Add()([x, ffn_output])
+
+    
+    # Classification head
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dropout(0.3)(x)
+    
+    outputs = layers.Dense(n_classes, activation='softmax')(x)
+
+    model = Model(inputs=inputs, outputs=outputs, name="Inception_Conformer")
     return model
