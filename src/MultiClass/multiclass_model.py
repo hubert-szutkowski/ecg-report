@@ -67,23 +67,19 @@ def build_inception_conformer(input_shape=(400, 1), n_classes=18):
     x = layers.MaxPooling1D(pool_size=2)(x) # Reduction to 100 samples
     
     # TRANSFORMER (Time-series modeling)
-    
-    attention_output = layers.MultiHeadAttention(
-        num_heads=4, 
-        key_dim=64, 
-        dropout=0.35
-    )(x, x)
-    
-    # Residual connection and layer normalization
+    x = PositionalEmbedding(sequence_length=100, output_dim=128)(x)
+
+    x_norm = layers.LayerNormalization(epsilon=1e-6)(x)
+    attention_output = layers.MultiHeadAttention(num_heads=4, key_dim=64, dropout=0.3)(x_norm, x_norm)
     x = layers.Add()([x, attention_output])
-    x = layers.LayerNormalization(epsilon=1e-6)(x)
-    
-    # Feed Forward network inside the transformer block
-    ffn_output = layers.Dense(64, activation='relu')(x)
+
+    x_norm2 = layers.LayerNormalization(epsilon=1e-6)(x)
+
+    ffn_output = layers.Dense(64, activation='relu')(x_norm2)
     ffn_output = layers.Dropout(0.3)(ffn_output)
     ffn_output = layers.Dense(128)(ffn_output)
+    
     x = layers.Add()([x, ffn_output])
-    x = layers.LayerNormalization(epsilon=1e-6)(x)
 
     
     # Classification head
