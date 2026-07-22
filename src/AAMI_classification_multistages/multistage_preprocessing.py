@@ -9,9 +9,9 @@ VEB = {'V', 'E'}
 FUSION = {'F'}
 UNKNOWN = {'/', 'f', 'Q', '?', " "}
 
-# Mapa: surowy symbol adnotacji -> jednoliterowa klasa AAMI
-# N celowo pominięte - normalne pobudzenia są odrzucane, nie mapowane
+#Mapping: raw annotation symbol -> single-letter AAMI class
 SYMBOL_TO_CLASS = {}
+SYMBOL_TO_CLASS.update({s: 'N' for s in NORMAL})
 SYMBOL_TO_CLASS.update({s: 'S' for s in SVEB})
 SYMBOL_TO_CLASS.update({s: 'V' for s in VEB})
 SYMBOL_TO_CLASS.update({s: 'F' for s in FUSION})
@@ -32,10 +32,10 @@ def get_record_ids(data_dir: str) -> list:
     return sorted(list(record_ids))
 
 
-def extract_anomaly_windows(signals, features_samples, features, window_back=150, window_forward=250):
+def extract_AAMI_windows(signals, features_samples, features, window_back=150, window_forward=250):
     """
     Slicing each anomaly into a window of samples around the peak. The window is defined by the number of samples before and after the peak.
-    Etykieta w y to jednoliterowa klasa AAMI (S/V/F/Q), nie surowy symbol adnotacji.
+    The label in y is the single-letter AAMI class (S/V/F/Q), not the raw annotation symbol.
 
     Parameters:
         signals (np.array): Complete ECG signal from which to extract windows.
@@ -53,10 +53,7 @@ def extract_anomaly_windows(signals, features_samples, features, window_back=150
     n_samples = len(signals)
 
     for sample_pos, symbol in zip(features_samples, features):
-        # Skipping normal beats, as they are not part of the anomaly classes we want to extract
-        if symbol in NORMAL:
-            continue
-
+        
         # Skipping symbols that do not have a corresponding AAMI class
         aami_class = SYMBOL_TO_CLASS.get(symbol)
         if aami_class is None:
@@ -77,15 +74,18 @@ def extract_anomaly_windows(signals, features_samples, features, window_back=150
     return np.array(X_windows), np.array(y_labels)
 
 
-def get_multiclass_data(dir_path: str, sample_select: int = 0):
+def get_data(dir_path: str, sample_select: int = 0, stage: str = 'binary'):
     """
-    Getting a specific record from the data directory and extracting anomaly windows.
+    Getting a specific record from the data directory and extracting AAMI windows.
     Parameters:
         dir_path (str): The path to the data directory.
         sample_select (int): The index of the record to select.
+        stage (str): The stage of the classification task ('binary' or 'multiclass').
     Returns:
         X (np.array): 2D array with the extracted windows [number_of_anomalies, window_width].
-        y (np.array): 1D array with the corresponding AAMI class labels ('S', 'V', 'F', 'Q').
+        y (np.array):
+            - for 'multiclass': 1D array with arrhythmia labels ('S', 'V', 'F', 'Q'), with 'N' removed
+            - for 'binary': 1D array with integer labels (0 for N, 1 for anomaly)
     """
     records_ids  = get_record_ids(dir_path)
     record_path  = str(Path(dir_path) / str(records_ids[sample_select]))
@@ -96,11 +96,22 @@ def get_multiclass_data(dir_path: str, sample_select: int = 0):
 
     signals, _ = wfdb.rdsamp(record_path, channels=[0])
 
-    X, y = extract_anomaly_windows(signals, features_samples, features)
+    X, y = extract_AAMI_windows(signals, features_samples, features)
+
+    if stage == 'binary':
+        # Binary target: normal beats -> 0, any non-normal AAMI class -> 1
+        y = (y != 'N').astype(np.int32)
+    elif stage == 'multiclass':
+        # Multiclass stage focuses on arrhythmia subtype discrimination, excluding normal beats.
+        arrhythmia_mask = (y != 'N')
+        X = X[arrhythmia_mask]
+        y = y[arrhythmia_mask]
+    elif stage != 'multiclass':
+        raise ValueError(f"Unsupported stage '{stage}'. Use 'binary' or 'multiclass'.")
 
     print(
         f"Record {records_ids[sample_select]:>6} | "
-        f"Anomaly removed: {len(y)} | "
+        f"Extracted windows: {len(y)} | "
         f"Unique labels: {np.unique(y)}"
     )
 
