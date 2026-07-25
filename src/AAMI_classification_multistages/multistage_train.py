@@ -179,7 +179,7 @@ def train_binary_stage(args):
         focal_loss = tf.keras.losses.BinaryFocalCrossentropy(
             alpha=0.25,
             gamma=1,
-            #label_smoothing=0.05,
+            # label_smoothing=0.05
         )
 
         model.compile(
@@ -231,7 +231,7 @@ def train_binary_stage(args):
                 y_test_raw,
                 y_pred_probs,
             )
-        except Exception as exc:  # pragma: no cover - defensive path
+        except Exception as exc:  # pragma: no cover
             print(f"Warning: Failed to calculate weighted AUC for fold {fold_number}: {exc}")
             best_val_auc = 0.5
 
@@ -422,7 +422,7 @@ def train_multiclass_stage(args):
                 average="weighted",
                 multi_class="ovr",
             )
-        except Exception as exc:  # pragma: no cover - defensive path
+        except Exception as exc:  # pragma: no cover
             print(f"Warning: Failed to calculate weighted AUC for fold {fold_number}: {exc}")
             best_val_auc = 0.5
 

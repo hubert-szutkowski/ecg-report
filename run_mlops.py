@@ -33,16 +33,16 @@ def run_command(command, step_name, exit_on_fail=True):
 def main():
     print("Starting MLOps pipeline...")
     
-    # 1. CT 
+    # CT
     train_cmd = "python submit_job.py"
     run_command(train_cmd, "CT stage")
     
-    # 2. CD 
+    # CD
     eval_cmd = 'python src/evaluate_and_register.py'
     
     is_new_champion = run_command(eval_cmd, "Champion vs Challenger", exit_on_fail=False)
     
-    # 3. Automatic PR
+    # Auto PR
     if is_new_champion:
         print("\n New champion registered. Initiating automatic PR process...")
         

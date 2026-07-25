@@ -14,12 +14,12 @@ def main():
     parser.add_argument("--direction", type=str, choices=["maximize", "minimize"], default="maximize", help="Whether to maximize (e.g., AUC) or minimize (e.g., loss) the metric")
     args = parser.parse_args()
 
-    #Initialize Azure ML Client and MLflow
+    # Init Azure ML and MLflow
     ml_client = MLClient.from_config(credential=DefaultAzureCredential())
     workspace = ml_client.workspaces.get(name=ml_client.workspace_name)
     mlflow.set_tracking_uri(workspace.mlflow_tracking_uri)
 
-    #Get the latest run from the specified experiment (Challenger)
+    # Load latest challenger run
     experiment = mlflow.get_experiment_by_name(args.experiment_name)
     if not experiment:
         print(f"CRITICAL: Experiment '{args.experiment_name}' not found.")
@@ -38,7 +38,7 @@ def main():
     latest_run = runs.iloc[0]
     challenger_run_id = latest_run.run_id
     
-    # Retrieve the custom metric from the run dataframe (MLflow prefixes metrics with 'metrics.')
+    # Read the target metric
     metric_column_name = f"metrics.{args.metric_name}"
     
     if metric_column_name not in latest_run:
@@ -49,8 +49,7 @@ def main():
     print(f"Challenger Run ID: {challenger_run_id}")
     print(f"Challenger score ({args.metric_name}): {challenger_score:.4f}")
 
-    # Retrieve the current Champion model from the Registry
-    # Initializing the base champion score depending on the evaluation direction
+    # Load current champion score
     best_registered_score = -float('inf') if args.direction == "maximize" else float('inf')
     
     try:
@@ -61,7 +60,7 @@ def main():
     except Exception:
         print("INFO: No registered Champion model found. This will be the first deployment.")
 
-    #Compare Challenger vs Champion based on the direction
+    # Compare challenger vs champion
     is_better = False
     if args.direction == "maximize":
         is_better = challenger_score > best_registered_score
@@ -88,10 +87,10 @@ def main():
         
         ml_client.models.create_or_update(new_champion)
         print(f"SUCCESS: Registered new Champion version with {args.metric_name}: {challenger_score:.4f}")
-        sys.exit(0)  # Exit with success code
+        sys.exit(0)  # Success
     else:
         print(f"REJECTED: Challenger score ({challenger_score:.4f}) did not beat Champion score ({best_registered_score:.4f}).")
-        sys.exit(1)  # Exit with failure code
+        sys.exit(1)  # Failure
 
 if __name__ == "__main__":
     main()

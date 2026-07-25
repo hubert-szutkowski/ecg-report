@@ -19,9 +19,9 @@ class PositionalEmbedding(layers.Layer):
         self.sequence_length = sequence_length
 
     def call(self, inputs):
-        # Generating a range of positions for the input sequence
+        # Build position ids
         positions = tf.range(start=0, limit=self.sequence_length, delta=1)
-        # Changing the shape of positions to match the input tensor's batch size
+        # Embed positions
         embedded_positions = self.position_embeddings(positions)
         return inputs + embedded_positions
 
@@ -35,20 +35,20 @@ def inception_module(input_tensor, filters=32):
     Returns:
         tf.Tensor: Output tensor after applying the inception module.
     """
-    #Branch 1: short signals (e.g., P wave)
+    # Branch 1: short range
     conv1 = layers.Conv1D(filters, kernel_size=9, padding='same', activation='relu',)(input_tensor)
     
-    # Branch 2: Medium signals (e.g., QRS complex)
+    # Branch 2: medium range
     conv2 = layers.Conv1D(filters, kernel_size=19, padding='same', activation='relu')(input_tensor)
     
-    # Branch 3: Long signals (e.g., T or U wave)
+    # Branch 3: long range
     conv3 = layers.Conv1D(filters, kernel_size=39, padding='same', activation='relu')(input_tensor)
     
-    # Branch 4: Pooling
+    # Branch 4: pool
     pool = layers.MaxPooling1D(pool_size=3, strides=1, padding='same')(input_tensor)
     conv4 = layers.Conv1D(filters, kernel_size=1, padding='same', activation='relu')(pool)
     
-    # Merging all branches
+    # Merge branches
     out = layers.Concatenate(axis=-1)([conv1, conv2, conv3, conv4])
     out = layers.BatchNormalization()(out)
     out = layers.SpatialDropout1D(0.25)(out)
@@ -58,15 +58,15 @@ def build_inception_conformer(input_shape=(400, 1), n_classes=18, stage='multicl
     inputs = layers.Input(shape=input_shape)
     
     
-    #INCEPTION (Morphological feature extraction)
+    # Inception block
     
     x = inception_module(inputs, filters=32)
-    x = layers.MaxPooling1D(pool_size=2)(x) # Reduction to 200 samples
+    x = layers.MaxPooling1D(pool_size=2)(x) # Downsample to 200
     
     x = inception_module(x, filters=32)
-    x = layers.MaxPooling1D(pool_size=2)(x) # Reduction to 100 samples
+    x = layers.MaxPooling1D(pool_size=2)(x) # Downsample to 100
     
-    # TRANSFORMER (Time-series modeling)
+    # Transformer block
     x = PositionalEmbedding(sequence_length=100, output_dim=128)(x)
 
     x_norm = layers.LayerNormalization(epsilon=1e-6)(x)
@@ -82,7 +82,7 @@ def build_inception_conformer(input_shape=(400, 1), n_classes=18, stage='multicl
     x = layers.Add()([x, ffn_output])
 
     
-    # Classification head
+    # Classifier head
     x = layers.GlobalAveragePooling1D()(x)
     x = layers.Dropout(0.3)(x)
 

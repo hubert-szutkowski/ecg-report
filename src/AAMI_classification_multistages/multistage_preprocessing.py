@@ -9,7 +9,7 @@ VEB = {'V', 'E'}
 FUSION = {'F'}
 UNKNOWN = {'/', 'f', 'Q', '?', " "}
 
-#Mapping: raw annotation symbol -> single-letter AAMI class
+# Map raw symbols to AAMI classes
 SYMBOL_TO_CLASS = {}
 SYMBOL_TO_CLASS.update({s: 'N' for s in NORMAL})
 SYMBOL_TO_CLASS.update({s: 'S' for s in SVEB})
@@ -54,18 +54,18 @@ def extract_AAMI_windows(signals, features_samples, features, window_back=150, w
 
     for sample_pos, symbol in zip(features_samples, features):
         
-        # Skipping symbols that do not have a corresponding AAMI class
+        # Skip unmapped symbols
         aami_class = SYMBOL_TO_CLASS.get(symbol)
         if aami_class is None:
             continue
 
-        #Calculating the window boundaries around the peak
+        # Compute window bounds
         start_idx = sample_pos - window_back
         end_idx = sample_pos + window_forward
 
-        #Protection against signal edges (beginning/end of the recording)
+        # Skip edge cases
         if start_idx >= 0 and end_idx < n_samples:
-            # Slicing the signal to get the window around the peak
+            # Slice the signal window
             window = signals[start_idx:end_idx].flatten()
 
             X_windows.append(window)
@@ -99,10 +99,10 @@ def get_data(dir_path: str, sample_select: int = 0, stage: str = 'binary'):
     X, y = extract_AAMI_windows(signals, features_samples, features)
 
     if stage == 'binary':
-        # Binary target: normal beats -> 0, any non-normal AAMI class -> 1
+        # Binary target
         y = (y != 'N').astype(np.int32)
     elif stage == 'multiclass':
-        # Multiclass stage focuses on arrhythmia subtype discrimination, excluding normal beats.
+        # Drop normal beats for multiclass
         arrhythmia_mask = (y != 'N')
         X = X[arrhythmia_mask]
         y = y[arrhythmia_mask]

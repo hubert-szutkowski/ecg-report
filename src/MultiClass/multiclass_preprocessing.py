@@ -9,8 +9,7 @@ VEB = {'V', 'E'}
 FUSION = {'F'}
 UNKNOWN = {'/', 'f', 'Q', '?', " "}
 
-# Mapa: surowy symbol adnotacji -> jednoliterowa klasa AAMI
-# N celowo pominięte - normalne pobudzenia są odrzucane, nie mapowane
+# Map raw symbols to AAMI classes
 SYMBOL_TO_CLASS = {}
 SYMBOL_TO_CLASS.update({s: 'S' for s in SVEB})
 SYMBOL_TO_CLASS.update({s: 'V' for s in VEB})
@@ -35,7 +34,7 @@ def get_record_ids(data_dir: str) -> list:
 def extract_anomaly_windows(signals, features_samples, features, window_back=150, window_forward=250):
     """
     Slicing each anomaly into a window of samples around the peak. The window is defined by the number of samples before and after the peak.
-    Etykieta w y to jednoliterowa klasa AAMI (S/V/F/Q), nie surowy symbol adnotacji.
+    The label in y is the AAMI class (S/V/F/Q), not the raw symbol.
 
     Parameters:
         signals (np.array): Complete ECG signal from which to extract windows.
@@ -53,22 +52,22 @@ def extract_anomaly_windows(signals, features_samples, features, window_back=150
     n_samples = len(signals)
 
     for sample_pos, symbol in zip(features_samples, features):
-        # Skipping normal beats, as they are not part of the anomaly classes we want to extract
+        # Skip normal beats
         if symbol in NORMAL:
             continue
 
-        # Skipping symbols that do not have a corresponding AAMI class
+        # Skip unmapped symbols
         aami_class = SYMBOL_TO_CLASS.get(symbol)
         if aami_class is None:
             continue
 
-        #Calculating the window boundaries around the peak
+        # Compute window bounds
         start_idx = sample_pos - window_back
         end_idx = sample_pos + window_forward
 
-        #Protection against signal edges (beginning/end of the recording)
+        # Skip edge cases
         if start_idx >= 0 and end_idx < n_samples:
-            # Slicing the signal to get the window around the peak
+            # Slice the signal window
             window = signals[start_idx:end_idx].flatten()
 
             X_windows.append(window)

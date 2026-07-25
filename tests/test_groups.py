@@ -12,7 +12,7 @@ def test_groups_alignment_for_cross_validation():
     record_106_windows = np.random.rand(15, 400) # 15 windows from patient 106
     record_119_windows = np.random.rand(10, 400) # 10 windows from patient 119
     
-    # Replicate load_all_multiclass_data aggregation logic
+    # Match aggregation logic
     X_list = [record_106_windows, record_119_windows]
     record_ids = ['106', '119']
     
