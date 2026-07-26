@@ -46,139 +46,73 @@ def _transformer_block(x,
     return x
 
 def build_generator(latent_dim=100):
-
     z = layers.Input(shape=(latent_dim,))
 
     x = layers.Dense(50 * 256)(z)
     x = layers.Reshape((50, 256))(x)
-
     x = layers.BatchNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
-    # 50
     x = _inception_block(x, 256)
     x = _transformer_block(x, 256)
 
     # 100
     x = layers.UpSampling1D(2)(x)
-
-    x = layers.Conv1D(
-        128,
-        kernel_size=21,
-        padding="same"
-    )(x)
-
+    x = layers.Conv1D(128, kernel_size=21, padding="same")(x)
     x = layers.BatchNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
-
     x = _inception_block(x, 128)
-    x = _transformer_block(x, 128)
 
     # 200
     x = layers.UpSampling1D(2)(x)
-
-    x = layers.Conv1D(
-        64,
-        kernel_size=15,
-        padding="same"
-    )(x)
-
+    x = layers.Conv1D(64, kernel_size=15, padding="same")(x)
     x = layers.BatchNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
-
     x = _inception_block(x, 64)
-    x = _transformer_block(x, 64)
 
     # 400
     x = layers.UpSampling1D(2)(x)
-
-    x = layers.Conv1D(
-        32,
-        kernel_size=11,
-        padding="same"
-    )(x)
-
+    x = layers.Conv1D(32, kernel_size=11, padding="same")(x)
     x = layers.BatchNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
-    x = _inception_block(x, 32)
-
+    
     output = layers.Conv1D(
         1,
         kernel_size=11,
         padding="same",
-        activation="linear"
+        activation="linear" 
     )(x)
 
     return Model(z, output, name="generator")
 
 def build_critic(input_shape=(400, 1)):
-
     inp = layers.Input(shape=input_shape)
 
     # 400 -> 200
-
-    x = _inception_block(inp, 64)
-
-    x = layers.Conv1D(
-        64,
-        kernel_size=31,
-        strides=2,
-        padding="same"
-    )(x)
-
+    x = layers.Conv1D(64, kernel_size=15, strides=2, padding="same")(inp)
     x = layers.LeakyReLU(0.2)(x)
+    
 
     # 200 -> 100
-
-    x = _inception_block(x, 128)
-
-    x = layers.Conv1D(
-        128,
-        kernel_size=21,
-        strides=2,
-        padding="same"
-    )(x)
-
+    x = layers.Conv1D(128, kernel_size=11, strides=2, padding="same")(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
-
-    x = _transformer_block(x, 128)
 
     # 100 -> 50
-
-    x = _inception_block(x, 256)
-
-    x = layers.Conv1D(
-        256,
-        kernel_size=15,
-        strides=2,
-        padding="same"
-    )(x)
-
+    x = layers.Conv1D(256, kernel_size=9, strides=2, padding="same")(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
-
-    x = _transformer_block(x, 256)
-
+    
     # 50 -> 25
-
-    x = layers.Conv1D(
-        512,
-        kernel_size=9,
-        strides=2,
-        padding="same"
-    )(x)
-
+    x = layers.Conv1D(512, kernel_size=7, strides=2, padding="same")(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
-    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Flatten()(x)
+    x = layers.Dropout(0.3)(x) 
 
-    out = layers.Dense(
-        1,
-        activation="linear"
-    )(x)
+    out = layers.Dense(1, activation="linear")(x)
 
     return Model(inp, out, name="critic")
 

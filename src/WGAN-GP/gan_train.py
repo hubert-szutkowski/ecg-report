@@ -10,7 +10,9 @@ import mlflow.tensorflow
 import tensorflow as tf
 import sys
 
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler, LabelEncoder, MinMaxScaler
+from sklearn.decomposition import PCA
+from tslearn.metrics import dtw
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 MULTICLASS_DIR = os.path.join(os.path.dirname(CURRENT_DIR), "MultiClass")
@@ -27,10 +29,10 @@ parser.add_argument("--data-dir", type=str, required=True, help="Path to raw ECG
 parser.add_argument("--target-class", type=str, required=True, default="V", help="Class label to train the GAN on (e.g., 'V', 'S', or '2')")
 parser.add_argument("--selected-samples", type=int, default=20, help="Number of ECG records to load")
 parser.add_argument("--window", type=int, default=400, help="Fixed window size around the R-peak") 
-parser.add_argument("--epochs", type=int, default=300, help="Number of training epochs (GANs need more!)")
-parser.add_argument("--batch-size", type=int, default=64, help="Batch size for training")
+parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs (GANs need more!)")
+parser.add_argument("--batch-size", type=int, default=128, help="Batch size for training")
 parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
-parser.add_argument("--start-learning-rate", type=float, default=1e-4, help="Learning rate for WGAN-GP (default 0.0002)")
+parser.add_argument("--start-learning-rate", type=float, default=5e-5, help="Learning rate for WGAN-GP (default 0.00005)")
 parser.add_argument("--latent-dim", type=int, default=100, help="Dimension of the latent noise vector")
 args = parser.parse_args()
 
@@ -101,6 +103,49 @@ class MLflowWGANCallback(tf.keras.callbacks.Callback):
             mlflow.log_metric("d_loss", logs.get("d_loss", 0), step=epoch)
             mlflow.log_metric("g_loss", logs.get("g_loss", 0), step=epoch)
 
+
+class EpochWeightsSaver(tf.keras.callbacks.Callback):
+    def __init__(self, filepath, interval=50):
+        super().__init__()
+        self.filepath = filepath
+        self.interval = interval
+        os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+
+    def on_epoch_end(self, epoch, logs=None):
+        if (epoch + 1) % self.interval == 0:
+            # separate paths for generator and critic weights
+            gen_path = self.filepath.format(epoch=epoch + 1).replace('.weights.h5', '_generator.weights.h5')
+            crit_path = self.filepath.format(epoch=epoch + 1).replace('.weights.h5', '_critic.weights.h5')
+            
+            # Save weights separately
+            self.model.generator.save_weights(gen_path)
+            self.model.critic.save_weights(crit_path)
+            
+            print(f"\n[Checkpoint] Saved (Generator, Critic) weights for epoch {epoch + 1}")
+
+class ECGSampleSaver(tf.keras.callbacks.Callback):
+    def __init__(self, latent_dim, output_dir="checkpoints/plots", interval=50):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.output_dir = output_dir
+        self.interval = interval
+        self.fixed_noise = tf.random.normal([4, self.latent_dim]) 
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def on_epoch_end(self, epoch, logs=None):
+        if (epoch + 1) % self.interval == 0:
+            generated_signals = self.model.generator(self.fixed_noise, training=False)
+            generated_signals = generated_signals.numpy()
+            
+            fig, axs = plt.subplots(4, 1, figsize=(10, 8))
+            for i in range(4):
+                axs[i].plot(generated_signals[i, :, 0], color='blue')
+                axs[i].set_ylim([-3, 3]) 
+            
+            plt.tight_layout()
+            plt.savefig(f"{self.output_dir}/epoch_{epoch+1}.png")
+            plt.close()
+
 def plot_wgan_losses(history, target_class):
     """Plot generator and critic loss."""
     d_loss = history.history['d_loss']
@@ -116,7 +161,37 @@ def plot_wgan_losses(history, target_class):
     plt.legend()
     plt.grid(True)
     plt.savefig(f'outputs/wgan_loss_curve_class_{target_class}.png')
-    plt.close()  
+    plt.close()
+
+def evaluate_distribution_pca(real_signals, fake_signals):
+    
+    real_flat = real_signals.reshape(real_signals.shape[0], -1)
+    fake_flat = fake_signals.reshape(fake_signals.shape[0], -1)
+    
+    pca = PCA(n_components=2)
+    real_pca = pca.fit_transform(real_flat)
+    fake_pca = pca.transform(fake_flat) 
+    
+    plt.scatter(real_pca[:, 0], real_pca[:, 1], alpha=0.5, label='Real')
+    plt.scatter(fake_pca[:, 0], fake_pca[:, 1], alpha=0.5, label='Generated')
+    plt.legend()
+    plt.title("PCA: Real vs Generated ECG")
+    plt.savefig("outputs/pca_evaluation.png")
+    plt.close()
+
+def calculate_mean_dtw(real_signals, fake_signals, n_samples=100):
+    """
+    Computing mean DTW distance between random pairs of real and generated signals.
+    """
+    distances = []
+    for i in range(n_samples):
+
+        idx_real = np.random.randint(0, real_signals.shape[0])
+        idx_fake = np.random.randint(0, fake_signals.shape[0])
+        d = dtw(real_signals[idx_real, :, 0], fake_signals[idx_fake, :, 0])
+        distances.append(d)
+        
+    return np.mean(distances)  
 
 def load_all_multiclass_data(data_dir: str, num_records: int, random_seed: int):
     # Load data with IQR downsampling.
@@ -167,6 +242,7 @@ os.makedirs('outputs/wgan_samples', exist_ok=True)
 
 # Load and parse data
 X_DATA, Y_LABELS, GROUPS = load_all_multiclass_data(args.data_dir, args.selected_samples, args.random_seed)
+print(X_DATA.shape, Y_LABELS.shape, GROUPS.shape)
 
 # Align label types
 encoder = LabelEncoder()
@@ -193,9 +269,10 @@ print(f"Isolated {len(X_minority)} samples for target class: {args.target_class}
 if len(X_minority) == 0:
     raise ValueError("No samples found for the target class!")
 
-# Z-score normalize
+# Scale the data
 scaler = StandardScaler()
-X_minority_scaled = scaler.fit_transform(X_minority)
+X_minority_flattened = X_minority.reshape(-1,1)
+X_minority_scaled = scaler.fit_transform(X_minority_flattened)
 joblib.dump(scaler, f'outputs/wgan_scaler_class_{args.target_class}.pkl')
 
 # Reshape for conv layers
@@ -223,11 +300,14 @@ wgan.compile(
     g_optimizer=generator_optimizer
 )
 
+
 # Configure callbacks
 callbacks = [
     # Save sample plots
     WGANMonitor(num_samples=4, latent_dim=args.latent_dim, save_dir='outputs/wgan_samples', class_name=args.target_class, real_samples=X_dataset_w),
-    MLflowWGANCallback()
+    MLflowWGANCallback(),
+    ECGSampleSaver(latent_dim=args.latent_dim, output_dir='outputs/wgan_samples', interval=50),
+    EpochWeightsSaver(filepath="checkpoints/weights/wgan_epoch_{epoch:03d}.weights.h5", interval=50)
 ]
 
 print(f"\n{'='*50}")
@@ -241,6 +321,23 @@ history = wgan.fit(
     callbacks=callbacks,
     verbose=1
 )
+
+test_noise = np.random.normal(0, 1, size=(1000, args.latent_dim))
+X_synthetic = wgan.generator.predict(test_noise, batch_size=args.batch_size)
+
+
+print("Computing evaluation metrics for generated samples...")
+
+# PCA evaluation
+evaluate_distribution_pca(X_dataset_w, X_synthetic)
+
+# DTW evaluation
+mean_dtw = calculate_mean_dtw(X_dataset_w, X_synthetic, n_samples=100)
+
+# Register metrics in MLflow
+mlflow.log_metric("final_mean_dtw", mean_dtw)
+
+print(f"Final mean DTW: {mean_dtw:.4f}")
 
 # Save outputs
 plot_wgan_losses(history, args.target_class)
