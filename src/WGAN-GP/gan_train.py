@@ -10,9 +10,12 @@ import mlflow.tensorflow
 import tensorflow as tf
 import sys
 
+from itertools import combinations
 from sklearn.preprocessing import StandardScaler, LabelEncoder, MinMaxScaler
 from sklearn.decomposition import PCA
 from tslearn.metrics import dtw
+from fastdtw import fastdtw
+from scipy.spatial.distance import euclidean
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 MULTICLASS_DIR = os.path.join(os.path.dirname(CURRENT_DIR), "MultiClass")
@@ -47,6 +50,30 @@ mlflow.log_params({
     "learning_rate": args.start_learning_rate,
     "model_type": "WGAN-GP_1D"
 })
+
+def calculate_real_dtw_baseline(real_signals):
+    """
+    Compute pairwise DTW distances between all real signals and return mean, median, and std.
+    """
+    n_samples = real_signals.shape[0]
+    dtw_distances = []
+    
+    for idx1, idx2 in combinations(range(n_samples), 2):
+        sig1 = real_signals[idx1].squeeze()
+        sig2 = real_signals[idx2].squeeze()
+        
+        distance, _ = fastdtw(sig1, sig2, dist=euclidean)
+        dtw_distances.append(distance)
+        
+    dtw_distances = np.array(dtw_distances)
+    
+    metrics = {
+        "mean_real_dtw": np.mean(dtw_distances),
+        "median_real_dtw": np.median(dtw_distances),
+        "std_real_dtw": np.std(dtw_distances)
+    }
+    
+    return metrics
 
 
 class WGANMonitor(tf.keras.callbacks.Callback):
@@ -338,6 +365,9 @@ mean_dtw = calculate_mean_dtw(X_dataset_w, X_synthetic, n_samples=100)
 mlflow.log_metric("final_mean_dtw", mean_dtw)
 
 print(f"Final mean DTW: {mean_dtw:.4f}")
+
+baseline_metrics = calculate_real_dtw_baseline(X_dataset_w)
+mlflow.log_metrics(baseline_metrics)
 
 # Save outputs
 plot_wgan_losses(history, args.target_class)
