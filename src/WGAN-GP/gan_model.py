@@ -1,120 +1,75 @@
 import tensorflow as tf
 from tensorflow.keras import layers, models, Model, Sequential
+import numpy as np
 
-
-
-def _inception_block(x, filters):
-
-    b1 = layers.Conv1D(filters // 4, 3, padding="same")(x)
-
-    b2 = layers.Conv1D(filters // 4, 7, padding="same")(x)
-
-    b3 = layers.Conv1D(filters // 4, 15, padding="same")(x)
-
-    b4 = layers.Conv1D(filters // 4, 31, padding="same")(x)
-
-    x = layers.Concatenate()([b1, b2, b3, b4])
-
-    x = layers.BatchNormalization()(x)
-    x = layers.LeakyReLU(0.2)(x)
-
-    return x
-
-
-def _transformer_block(x,
-                       embed_dim,
-                       num_heads=4,
-                       ff_dim=None):
-
-    if ff_dim is None:
-        ff_dim = embed_dim * 4
-
-    attn = layers.MultiHeadAttention(
-        num_heads=num_heads,
-        key_dim=embed_dim // num_heads,
-    )(x, x)
-
-    x = layers.Add()([x, attn])
-    x = layers.LayerNormalization()(x)
-
-    ff = layers.Dense(ff_dim, activation="gelu")(x)
-    ff = layers.Dense(embed_dim)(ff)
-
-    x = layers.Add()([x, ff])
-    x = layers.LayerNormalization()(x)
-
-    return x
-
-def build_generator(latent_dim=100):
+def build_generator(window_size=216, latent_dim=100):
+    
+    upsampling_factor = 2 ** 3
+    
+    
+    base_length = int(np.ceil(window_size / upsampling_factor))
+    generated_length = base_length * upsampling_factor
+    
     z = layers.Input(shape=(latent_dim,))
 
-    x = layers.Dense(50 * 256)(z)
-    x = layers.Reshape((50, 256))(x)
-    x = layers.BatchNormalization()(x)
+    
+    x = layers.Dense(base_length * 32)(z)
+    x = layers.Reshape((base_length, 32))(x)
+    x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
-    x = _inception_block(x, 256)
-    x = _transformer_block(x, 256)
-
-    # 100
+    # Block 1: x2
     x = layers.UpSampling1D(2)(x)
-    x = layers.Conv1D(128, kernel_size=21, padding="same")(x)
-    x = layers.BatchNormalization()(x)
+    x = layers.Conv1D(64, kernel_size=7, padding="same")(x)
+    x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
-    x = _inception_block(x, 128)
+    x = layers.Dropout(0.3)(x)
 
-    # 200
+    # Block 2: x2
     x = layers.UpSampling1D(2)(x)
-    x = layers.Conv1D(64, kernel_size=15, padding="same")(x)
-    x = layers.BatchNormalization()(x)
+    x = layers.Conv1D(32, kernel_size=5, padding="same")(x)
+    x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
-    x = _inception_block(x, 64)
+    x = layers.Dropout(0.3)(x)
 
-    # 400
+    # Block 3: x2
     x = layers.UpSampling1D(2)(x)
-    x = layers.Conv1D(32, kernel_size=11, padding="same")(x)
-    x = layers.BatchNormalization()(x)
+    x = layers.Conv1D(16, kernel_size=3, padding="same")(x)
+    x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
     
-    output = layers.Conv1D(
-        1,
-        kernel_size=11,
-        padding="same",
-        activation="linear" 
-    )(x)
+    if generated_length > window_size:
+        crop_size = generated_length - window_size
+        x = layers.Cropping1D(cropping=(0, crop_size))(x)
 
-    return Model(z, output, name="generator")
+    
+    output = layers.Conv1D(1, kernel_size=3, padding="same", activation="linear")(x)
+    
+    return Model(z, output, name="dynamic_slim_generator")
 
-def build_critic(input_shape=(400, 1)):
+def build_critic(input_shape=(216, 1)):
     inp = layers.Input(shape=input_shape)
 
-    # 400 -> 200
-    x = layers.Conv1D(64, kernel_size=15, strides=2, padding="same")(inp)
+    # 216 -> 108
+    x = layers.Conv1D(32, kernel_size=7, strides=2, padding="same")(inp)
     x = layers.LeakyReLU(0.2)(x)
-    
 
-    # 200 -> 100
-    x = layers.Conv1D(128, kernel_size=11, strides=2, padding="same")(x)
+    # 108 -> 54
+    x = layers.Conv1D(64, kernel_size=5, strides=2, padding="same")(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
-    # 100 -> 50
-    x = layers.Conv1D(256, kernel_size=9, strides=2, padding="same")(x)
-    x = layers.LayerNormalization()(x)
-    x = layers.LeakyReLU(0.2)(x)
-    
-    # 50 -> 25
-    x = layers.Conv1D(512, kernel_size=7, strides=2, padding="same")(x)
+    # 54 -> 27
+    x = layers.Conv1D(128, kernel_size=3, strides=2, padding="same")(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
     x = layers.Flatten()(x)
-    x = layers.Dropout(0.3)(x) 
-
+    x = layers.Dropout(0.3)(x)
+    
     out = layers.Dense(1, activation="linear")(x)
-
-    return Model(inp, out, name="critic")
+    return Model(inp, out, name="slim_critic")
 
 class WGANGP(Model):
     def __init__(self, generator, critic, latent_dim, d_steps=5, gp_weight=10.0):

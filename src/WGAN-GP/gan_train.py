@@ -15,14 +15,14 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder, MinMaxScaler
 from sklearn.decomposition import PCA
 from tslearn.metrics import dtw
 from fastdtw import fastdtw
-from scipy.spatial.distance import euclidean
+
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 MULTICLASS_DIR = os.path.join(os.path.dirname(CURRENT_DIR), "MultiClass")
 if MULTICLASS_DIR not in sys.path:
     sys.path.insert(0, MULTICLASS_DIR)
 
-from multiclass_preprocessing import get_record_ids, get_multiclass_data
+from multiclass_preprocessing import get_record_ids, get_multiclass_data, get_global_window_size
 
 
 from gan_model import WGANGP, build_generator, build_critic
@@ -31,16 +31,14 @@ parser = argparse.ArgumentParser(description="WGAN-GP Training Pipeline for ECG 
 parser.add_argument("--data-dir", type=str, required=True, help="Path to raw ECG data")
 parser.add_argument("--target-class", type=str, required=True, default="V", help="Class label to train the GAN on (e.g., 'V', 'S', or '2')")
 parser.add_argument("--selected-samples", type=int, default=20, help="Number of ECG records to load")
-parser.add_argument("--window", type=int, default=400, help="Fixed window size around the R-peak") 
 parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs (GANs need more!)")
 parser.add_argument("--batch-size", type=int, default=128, help="Batch size for training")
 parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
 parser.add_argument("--start-learning-rate", type=float, default=5e-5, help="Learning rate for WGAN-GP (default 0.00005)")
-parser.add_argument("--latent-dim", type=int, default=100, help="Dimension of the latent noise vector")
+parser.add_argument("--latent-dim", type=int, default=32, help="Dimension of the latent noise vector")
 args = parser.parse_args()
 
 mlflow.log_params({
-    "window_size": args.window,
     "epochs": args.epochs,
     "target_class": args.target_class,
     "selected_samples": args.selected_samples,
@@ -51,29 +49,30 @@ mlflow.log_params({
     "model_type": "WGAN-GP_1D"
 })
 
-def calculate_real_dtw_baseline(real_signals):
-    """
-    Compute pairwise DTW distances between all real signals and return mean, median, and std.
-    """
-    n_samples = real_signals.shape[0]
-    dtw_distances = []
+# def calculate_real_dtw_baseline(real_signals):
+#     """
+#     Compute pairwise DTW distances between all real signals and return mean, median, and std.
+#     """
+#     n_samples = real_signals.shape[0]
+#     dtw_distances = []
     
-    for idx1, idx2 in combinations(range(n_samples), 2):
-        sig1 = real_signals[idx1].squeeze()
-        sig2 = real_signals[idx2].squeeze()
+#     for idx1, idx2 in combinations(range(n_samples), 2):
+#         sig1 = real_signals[idx1].squeeze()
+#         sig2 = real_signals[idx2].squeeze()
         
-        distance, _ = fastdtw(sig1, sig2, dist=euclidean)
-        dtw_distances.append(distance)
+#         distance, _ = fastdtw(sig1, sig2)
+#         dtw_distances.append(distance)
+#         print(f"Computed DTW between sample {idx1} and {idx2}: {distance:.4f}")
         
-    dtw_distances = np.array(dtw_distances)
+#     dtw_distances = np.array(dtw_distances)
     
-    metrics = {
-        "mean_real_dtw": np.mean(dtw_distances),
-        "median_real_dtw": np.median(dtw_distances),
-        "std_real_dtw": np.std(dtw_distances)
-    }
+#     metrics = {
+#         "mean_real_dtw": np.mean(dtw_distances),
+#         "median_real_dtw": np.median(dtw_distances),
+#         "std_real_dtw": np.std(dtw_distances)
+#     }
     
-    return metrics
+#     return metrics
 
 
 class WGANMonitor(tf.keras.callbacks.Callback):
@@ -225,9 +224,9 @@ def load_all_multiclass_data(data_dir: str, num_records: int, random_seed: int):
     X_all, y_all, groups_all = [], [], []
     record_ids = get_record_ids(data_dir)
     records_to_process = min(num_records, len(record_ids))
-    
+    global_distance = get_global_window_size(data_dir, record_ids)
     for i in range(records_to_process):
-        X_record, y_record = get_multiclass_data(data_dir, sample_select=i)
+        X_record, y_record = get_multiclass_data(data_dir, sample_select=i, window_size=global_distance)
         if len(X_record) > 0:
             X_all.append(X_record)
             y_all.append(y_record)
@@ -262,15 +261,15 @@ def load_all_multiclass_data(data_dir: str, num_records: int, random_seed: int):
             valid_indices.extend(patient_cls_idx)
 
     valid_indices = np.sort(valid_indices)
-    return X_master[valid_indices], y_master[valid_indices], groups_master[valid_indices]
+    return X_master[valid_indices], y_master[valid_indices], groups_master[valid_indices], global_distance
 
 
 os.makedirs('outputs/wgan_samples', exist_ok=True)
 
 # Load and parse data
-X_DATA, Y_LABELS, GROUPS = load_all_multiclass_data(args.data_dir, args.selected_samples, args.random_seed)
+X_DATA, Y_LABELS, GROUPS, window_size = load_all_multiclass_data(args.data_dir, args.selected_samples, args.random_seed)
 print(X_DATA.shape, Y_LABELS.shape, GROUPS.shape)
-
+mlflow.log_metrics({"window_size": window_size})
 # Align label types
 encoder = LabelEncoder()
 Y_ENCODED = encoder.fit_transform(Y_LABELS)
@@ -278,6 +277,7 @@ joblib.dump(encoder, 'outputs/label_encoder_wgan.pkl')
 
 print(f"\nTotal extracted windows in dataset: {len(X_DATA)}")
 print(f"Detected classes: {encoder.classes_}")
+print(f"Window size used: {window_size}")
 
 # Filter the target class
 try:
@@ -303,12 +303,13 @@ X_minority_scaled = scaler.fit_transform(X_minority_flattened)
 joblib.dump(scaler, f'outputs/wgan_scaler_class_{args.target_class}.pkl')
 
 # Reshape for conv layers
-X_dataset_w = X_minority_scaled.reshape(-1, args.window, 1).astype(np.float32)
-
+X_dataset_w = X_minority_scaled.reshape(-1, window_size, 1).astype(np.float32)
+#baseline_metrics = calculate_real_dtw_baseline(X_dataset_w)
+#print(baseline_metrics)
 # Build models
 print("Building Generator and Critic...")
-generator = build_generator(latent_dim=args.latent_dim)
-critic = build_critic(input_shape=(args.window, 1))
+generator = build_generator(window_size=window_size, latent_dim=args.latent_dim)
+critic = build_critic(input_shape=(window_size, 1))
 
 wgan = WGANGP(
     generator=generator, 
@@ -365,9 +366,6 @@ mean_dtw = calculate_mean_dtw(X_dataset_w, X_synthetic, n_samples=100)
 mlflow.log_metric("final_mean_dtw", mean_dtw)
 
 print(f"Final mean DTW: {mean_dtw:.4f}")
-
-baseline_metrics = calculate_real_dtw_baseline(X_dataset_w)
-mlflow.log_metrics(baseline_metrics)
 
 # Save outputs
 plot_wgan_losses(history, args.target_class)

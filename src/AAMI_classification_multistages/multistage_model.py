@@ -54,20 +54,22 @@ def inception_module(input_tensor, filters=32):
     out = layers.SpatialDropout1D(0.25)(out)
     return out
 
-def build_inception_conformer(input_shape=(400, 1), n_classes=18, stage='multiclass'):
-    inputs = layers.Input(shape=input_shape)
-    
+def build_inception_conformer(window_size: int, n_classes: int = 18, stage: str = "multiclass") -> Model:
+    # Define the input shape based on the window size
+    inputs = layers.Input(shape=(window_size, 1))
     
     # Inception block
-    
     x = inception_module(inputs, filters=32)
-    x = layers.MaxPooling1D(pool_size=2)(x) # Downsample to 200
+    x = layers.MaxPooling1D(pool_size=2)(x) 
     
     x = inception_module(x, filters=32)
-    x = layers.MaxPooling1D(pool_size=2)(x) # Downsample to 100
+    x = layers.MaxPooling1D(pool_size=2)(x) 
     
-    # Transformer block
-    x = PositionalEmbedding(sequence_length=100, output_dim=128)(x)
+    # Dynamic sequence length for the transformer block based on the window size
+    seq_length = window_size // 4
+    
+    # Transformer block 
+    x = PositionalEmbedding(sequence_length=seq_length, output_dim=128)(x)
 
     x_norm = layers.LayerNormalization(epsilon=1e-6)(x)
     attention_output = layers.MultiHeadAttention(num_heads=4, key_dim=64, dropout=0.3)(x_norm, x_norm)
@@ -80,14 +82,11 @@ def build_inception_conformer(input_shape=(400, 1), n_classes=18, stage='multicl
     ffn_output = layers.Dense(128)(ffn_output)
     
     x = layers.Add()([x, ffn_output])
-
     
     # Classifier head
     x = layers.GlobalAveragePooling1D()(x)
     x = layers.Dropout(0.3)(x)
-
-    
-    if stage == 'binary':
+    if stage == "binary":
         outputs = layers.Dense(1, activation='sigmoid')(x)
     else:
         outputs = layers.Dense(n_classes, activation='softmax')(x)

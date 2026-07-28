@@ -32,7 +32,7 @@ def get_record_ids(data_dir: str) -> list:
     return sorted(list(record_ids))
 
 
-def extract_AAMI_windows(signals, features_samples, features, window_back=150, window_forward=250):
+def extract_AAMI_windows(signals, features_samples, features, window_size=216, normal_symbols=NORMAL, symbol_to_class=SYMBOL_TO_CLASS):
     """
     Slicing each anomaly into a window of samples around the peak. The window is defined by the number of samples before and after the peak.
     The label in y is the single-letter AAMI class (S/V/F/Q), not the raw annotation symbol.
@@ -41,8 +41,9 @@ def extract_AAMI_windows(signals, features_samples, features, window_back=150, w
         signals (np.array): Complete ECG signal from which to extract windows.
         features_samples (list/np.array): Indices of the peaks in the signal corresponding to the features.
         features (list/np.array): Labels of the features corresponding to the peaks (e.g., 'V', 'A', 'N').
-        window_back (int): Number of samples to extract before the peak.
-        window_forward (int): Number of samples to extract after the peak.
+        window_size (int): The size of the window to extract around each peak.
+        normal_symbols (set): Set of symbols representing normal beats.
+        symbol_to_class (dict): Mapping from raw symbols to AAMI classes.
 
     Returns:
         X (np.array): 2D array with the extracted windows [number_of_anomalies, window_width].
@@ -51,36 +52,34 @@ def extract_AAMI_windows(signals, features_samples, features, window_back=150, w
     X_windows = []
     y_labels = []
     n_samples = len(signals)
+    half_window = window_size // 2
 
     for sample_pos, symbol in zip(features_samples, features):
         
-        # Skip unmapped symbols
-        aami_class = SYMBOL_TO_CLASS.get(symbol)
+        aami_class = symbol_to_class.get(symbol)
         if aami_class is None:
             continue
 
-        # Compute window bounds
-        start_idx = sample_pos - window_back
-        end_idx = sample_pos + window_forward
+        start_idx = sample_pos - half_window
+        end_idx = start_idx + window_size
 
-        # Skip edge cases
-        if start_idx >= 0 and end_idx < n_samples:
-            # Slice the signal window
+        if start_idx >= 0 and end_idx <= n_samples:
             window = signals[start_idx:end_idx].flatten()
-
+            
             X_windows.append(window)
             y_labels.append(aami_class)
 
     return np.array(X_windows), np.array(y_labels)
 
 
-def get_data(dir_path: str, sample_select: int = 0, stage: str = 'binary'):
+def get_data(dir_path: str, sample_select: int = 0, stage: str = 'binary', window_size: int = 216):
     """
     Getting a specific record from the data directory and extracting AAMI windows.
     Parameters:
         dir_path (str): The path to the data directory.
         sample_select (int): The index of the record to select.
         stage (str): The stage of the classification task ('binary' or 'multiclass').
+        window_size (int): The size of the window to extract around each peak.
     Returns:
         X (np.array): 2D array with the extracted windows [number_of_anomalies, window_width].
         y (np.array):
@@ -96,7 +95,7 @@ def get_data(dir_path: str, sample_select: int = 0, stage: str = 'binary'):
 
     signals, _ = wfdb.rdsamp(record_path, channels=[0])
 
-    X, y = extract_AAMI_windows(signals, features_samples, features)
+    X, y = extract_AAMI_windows(signals, features_samples, features, window_size=window_size)
 
     if stage == 'binary':
         # Binary target
@@ -116,3 +115,24 @@ def get_data(dir_path: str, sample_select: int = 0, stage: str = 'binary'):
     )
 
     return X, y
+
+def get_global_window_size(dir_path: str, record_ids: list, scale_factor: float = 0.8) -> int:
+    all_rr_distances = []
+    
+    for record in record_ids:
+        record_path = str(Path(dir_path) / str(record))
+        ecg_annotations = wfdb.rdann(record_path, 'atr')
+        
+        features_samples = ecg_annotations.sample
+        rr_distances = np.diff(features_samples)
+        all_rr_distances.extend(rr_distances)
+        
+    all_rr_distances = np.array(all_rr_distances)
+    valid_rr_distances = all_rr_distances[all_rr_distances > 0]
+    raw_median = np.median(valid_rr_distances)
+    global_seq_len = int(np.floor(raw_median * scale_factor))
+    
+    if global_seq_len % 2 != 0:
+        global_seq_len -= 1
+        
+    return global_seq_len
