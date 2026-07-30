@@ -14,10 +14,16 @@ develop-eggs/
 dist/
 data/
 downloads/
+Azure/
 eggs/
 .eggs/
 outputs/
+checkpoints/
+*.keras
+*.pkl
 lib/
+.conda/
+models/
 lib64/
 parts/
 sdist/
