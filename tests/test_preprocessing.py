@@ -16,9 +16,9 @@ def test_extract_anomaly_windows_filtering_and_shapes():
     signals = np.sin(np.linspace(0, 50, 1000))
     
     # Mock annotations:
-    # - Index 200: Anomaly 'V' (Valid, should be extracted)
-    # - Index 500: Normal beat 'N' (Should be skipped)
-    # - Index 900: Anomaly 'A' (Out of bounds: 900 + 250 > 1000, should be skipped)
+    # - Index 200: valid anomaly
+    # - Index 500: normal beat
+    # - Index 900: out of bounds
     features_samples = [200, 500, 900]
     features = ['V', 'N', 'A']
     
@@ -35,15 +35,15 @@ def test_extract_anomaly_windows_filtering_and_shapes():
     )
     
     # Assertions
-    # Out of 3 peaks, only the first one ('V' at index 200) satisfies all conditions
+    # Only one peak should pass
     assert len(X) == 1, f"Expected 1 extracted window, got {len(X)}"
     assert len(y) == 1, f"Expected 1 label, got {len(y)}"
     assert y[0] == 'V', f"Expected label to be 'V', got '{y[0]}'"
     
-    # Check if the window size is exactly 400 (150 back + 250 forward)
+    # Check window size
     assert X.shape[1] == 400, f"Expected window width of 400, got {X.shape[1]}"
     
-    # Verify that the extracted window matches the exact sliced mathematical signal
+    # Check extracted window
     expected_slice = signals[200 - window_back : 200 + window_forward].flatten()
     np.testing.assert_array_equal(X[0], expected_slice)
 

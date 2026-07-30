@@ -17,3 +17,5 @@ dependencies:
     - mlflow
     - azureml-mlflow
     - azureml-core
+    - tslearn
+    - fastdtw

@@ -22,21 +22,20 @@ def build_ecg_model(input_shape: tuple, n_classes: int) -> tf.keras.Model:
 
     def conv_block(filters: int, kernel_size: int):
         return [
-            # 1. Lekkie L2 w konwolucjach zapobiega drastycznym wagom reagującym na szum
+            # Light L2 regularization
             Conv1D(filters, kernel_size=kernel_size, padding='same', use_bias=False, 
                    kernel_regularizer=l2(1e-4)),
             BatchNormalization(),
             Activation('relu'),
             MaxPooling1D(4),
-            # 2. Zmiana na SpatialDropout1D - wyłącza całe mapy cech, a nie pojedyncze punkty
+            # Drop whole feature maps
             SpatialDropout1D(0.3),
         ]
 
     model = Sequential([
         Input(shape=input_shape),           
         
-        # 3. Szum Gaussa na wejściu. Zakładamy, że sygnał przeszedł przez StandardScaler, 
-        # więc odchylenie 0.05 to 5% wariancji. Symuluje to realne zakłócenia z elektrod.
+        # Input Gaussian noise
         GaussianNoise(0.05),
 
         *conv_block(32,  kernel_size=16),   
@@ -45,7 +44,7 @@ def build_ecg_model(input_shape: tuple, n_classes: int) -> tf.keras.Model:
 
         GlobalAveragePooling1D(),           
 
-        # Mocniejsza regularyzacja na warstwie w pełni połączonej
+        # Stronger dense regularization
         Dense(64, activation='relu', kernel_regularizer=l2(1e-3)),
         Dropout(0.5),
 

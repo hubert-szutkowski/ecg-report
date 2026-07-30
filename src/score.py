@@ -18,47 +18,45 @@ def run(raw_data):
     Function called for each request to the deployment endpoint. It processes the input data, performs preprocessing, and returns the prediction results.
     """
     try:
-        # 1. Parse input JSON data
+        # Parse input JSON
         data = json.loads(raw_data)
         
-        # Extract Record_Id, Okno, and Sygnal from the input data
+        # Read request fields
         record_id = data.get('Record_Id', 'UNKNOWN')
         okno = data.get('Okno', 0)
         signal = np.array(data.get('Sygnal', []))
         
-        # Check if the signal has the expected length of 1024 samples
+        # Validate length
         if len(signal) != 1024:
             return {
                 "Record_Id": record_id,
                 "Okno": okno,
-                "error": f"Oczekiwano 1024 próbek, otrzymano {len(signal)}."
+                "error": f"Expected 1024 samples, got {len(signal)}."
             }
         
-        # 2. Preprocessing (Z-score)
+        # Z-score normalize
         mean = np.mean(signal)
         std = np.std(signal)
         if std > 0:
             signal = (signal - mean) / std
             
-        # 3. Reshape the signal for model input
+        # Reshape for model input
         input_tensor = signal.reshape(1, 1024, 1).astype(np.float32)
         
-        # 4. Prediction
-        
-        # Surowy wynik z modelu to prawdopodobieństwo klasy 0 (Normal)
+        # Predict
         normal_prob = float(model.predict(input_tensor)[0][0])
 
-        # Obliczamy prawdopodobieństwo anomalii (klasy 1)
+        # Convert to anomaly probability
         anomaly_prob = 1.0 - normal_prob
 
-        # Próg klasyfikacji ustawiony na szansę wystąpienia anomalii
+        # Threshold anomaly score
         is_anomaly = 1 if anomaly_prob > 0.5 else 0
 
         return {
             "Record_Id": record_id,
             "Okno": okno,
             "Prediction": "Anomaly" if is_anomaly == 1 else "Normal",
-            "Probability": round(anomaly_prob, 4), # Wysyłamy do Power BI szansę na anomalię
+            "Probability": round(anomaly_prob, 4),
             "Is_Anomaly": is_anomaly
         }
         

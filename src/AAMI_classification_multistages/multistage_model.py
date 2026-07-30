@@ -19,9 +19,9 @@ class PositionalEmbedding(layers.Layer):
         self.sequence_length = sequence_length
 
     def call(self, inputs):
-        # Generating a range of positions for the input sequence
+        # Build position ids
         positions = tf.range(start=0, limit=self.sequence_length, delta=1)
-        # Changing the shape of positions to match the input tensor's batch size
+        # Embed positions
         embedded_positions = self.position_embeddings(positions)
         return inputs + embedded_positions
 
@@ -35,39 +35,41 @@ def inception_module(input_tensor, filters=32):
     Returns:
         tf.Tensor: Output tensor after applying the inception module.
     """
-    #Branch 1: short signals (e.g., P wave)
+    # Branch 1: short range
     conv1 = layers.Conv1D(filters, kernel_size=9, padding='same', activation='relu',)(input_tensor)
     
-    # Branch 2: Medium signals (e.g., QRS complex)
+    # Branch 2: medium range
     conv2 = layers.Conv1D(filters, kernel_size=19, padding='same', activation='relu')(input_tensor)
     
-    # Branch 3: Long signals (e.g., T or U wave)
+    # Branch 3: long range
     conv3 = layers.Conv1D(filters, kernel_size=39, padding='same', activation='relu')(input_tensor)
     
-    # Branch 4: Pooling
+    # Branch 4: pool
     pool = layers.MaxPooling1D(pool_size=3, strides=1, padding='same')(input_tensor)
     conv4 = layers.Conv1D(filters, kernel_size=1, padding='same', activation='relu')(pool)
     
-    # Merging all branches
+    # Merge branches
     out = layers.Concatenate(axis=-1)([conv1, conv2, conv3, conv4])
     out = layers.BatchNormalization()(out)
     out = layers.SpatialDropout1D(0.25)(out)
     return out
 
-def build_inception_conformer(input_shape=(400, 1), n_classes=18, stage='multiclass'):
-    inputs = layers.Input(shape=input_shape)
+def build_inception_conformer(window_size: int, n_classes: int = 18, stage: str = "multiclass") -> Model:
+    # Define the input shape based on the window size
+    inputs = layers.Input(shape=(window_size, 1))
     
-    
-    #INCEPTION (Morphological feature extraction)
-    
+    # Inception block
     x = inception_module(inputs, filters=32)
-    x = layers.MaxPooling1D(pool_size=2)(x) # Reduction to 200 samples
+    x = layers.MaxPooling1D(pool_size=2)(x) 
     
     x = inception_module(x, filters=32)
-    x = layers.MaxPooling1D(pool_size=2)(x) # Reduction to 100 samples
+    x = layers.MaxPooling1D(pool_size=2)(x) 
     
-    # TRANSFORMER (Time-series modeling)
-    x = PositionalEmbedding(sequence_length=100, output_dim=128)(x)
+    # Dynamic sequence length for the transformer block based on the window size
+    seq_length = window_size // 4
+    
+    # Transformer block 
+    x = PositionalEmbedding(sequence_length=seq_length, output_dim=128)(x)
 
     x_norm = layers.LayerNormalization(epsilon=1e-6)(x)
     attention_output = layers.MultiHeadAttention(num_heads=4, key_dim=64, dropout=0.3)(x_norm, x_norm)
@@ -80,14 +82,11 @@ def build_inception_conformer(input_shape=(400, 1), n_classes=18, stage='multicl
     ffn_output = layers.Dense(128)(ffn_output)
     
     x = layers.Add()([x, ffn_output])
-
     
-    # Classification head
+    # Classifier head
     x = layers.GlobalAveragePooling1D()(x)
     x = layers.Dropout(0.3)(x)
-
-    
-    if stage == 'binary':
+    if stage == "binary":
         outputs = layers.Dense(1, activation='sigmoid')(x)
     else:
         outputs = layers.Dense(n_classes, activation='softmax')(x)

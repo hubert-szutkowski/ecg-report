@@ -24,6 +24,6 @@ def test_build_ecg_multiclass_model_architecture():
     # 2. Assert output shape
     assert model.output_shape == (None, 6), f"Expected output shape (None, 6), got {model.output_shape}"
     
-    # 3. Assert that the final layer uses softmax activation
+    # Check softmax output
     final_layer_activation = model.layers[-1].activation.__name__
     assert final_layer_activation == 'softmax', f"Expected 'softmax' activation, got '{final_layer_activation}'"

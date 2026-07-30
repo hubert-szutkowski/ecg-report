@@ -10,7 +10,7 @@ import mlflow
 import mlflow.tensorflow
 import tensorflow as tf
 
-from multistage_preprocessing import get_record_ids, get_data
+from multistage_preprocessing import get_record_ids, get_data, get_global_window_size
 
 from multistage_model import build_inception_conformer
 from data_augment import augment_ecg
@@ -39,7 +39,6 @@ def build_parser():
     parser = argparse.ArgumentParser(description="ECG Multistage Training Pipeline")
     parser.add_argument("--data-dir", type=str, required=True, help="Path to raw ECG data")
     parser.add_argument("--selected-samples", type=int, default=20, help="Number of ECG records to load")
-    parser.add_argument("--window", type=int, default=400, help="Fixed window size around the R-peak")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for training")
     parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
@@ -71,6 +70,59 @@ def plot_loss(history, fold_number, stage):
     plt.savefig(f"outputs/loss_curve_fold_{fold_number}_stage_{stage}.png")
     plt.close()
 
+def samples_plot(X_data, y_labels, encoder, stage, random_state):
+    """
+    Plots a random sample from each class in the dataset.
+    Parameters:
+        X_data (np.array): 2D array of ECG windows.
+        y_labels (np.array): 1D array of corresponding labels.
+        encoder (LabelEncoder): Encoder to transform labels back to original class names.
+        stage (str): The stage of the classification task ('binary' or 'multiclass').
+        random_state (int): Seed for reproducibility of random sampling.
+    """
+    rng = np.random.default_rng(random_state)
+
+    if stage == "binary":
+        class_indices = [0, 1]
+        class_names = ["N", "anomaly"]
+    else:
+        class_indices = list(range(len(encoder.classes_)))
+        class_names = list(encoder.classes_)
+
+    selected_indices = []
+    selected_titles = []
+
+    for class_index, class_name in zip(class_indices, class_names):
+        candidate_indices = np.where(y_labels == class_index)[0]
+        if len(candidate_indices) == 0:
+            continue
+        chosen_index = int(rng.choice(candidate_indices))
+        selected_indices.append(chosen_index)
+        selected_titles.append(class_name)
+
+    if not selected_indices:
+        print(f"No samples available to plot for stage '{stage}'.")
+        return
+
+    fig, axes = plt.subplots(len(selected_indices), 1, figsize=(12, 3 * len(selected_indices)), sharex=True)
+    if len(selected_indices) == 1:
+        axes = [axes]
+
+    for axis, sample_index, title in zip(axes, selected_indices, selected_titles):
+        axis.plot(X_data[sample_index])
+        axis.set_title(f"{stage.capitalize()} sample: {title}")
+        axis.set_ylabel("Amplitude")
+        axis.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel("Time")
+    plt.tight_layout()
+
+    os.makedirs("outputs", exist_ok=True)
+    output_path = f"outputs/sample_preview_{stage}.png"
+    plt.savefig(output_path)
+    plt.close(fig)
+    print(f"Saved sample preview to {output_path}")
+
 
 def load_data(data_dir: str, num_records: int, random_seed: int, stage: str):
     """
@@ -80,9 +132,10 @@ def load_data(data_dir: str, num_records: int, random_seed: int, stage: str):
     X_all, y_all, groups_all = [], [], []
     record_ids = get_record_ids(data_dir)
     records_to_process = min(num_records, len(record_ids))
-
+    window_size = get_global_window_size(data_dir, record_ids)
+    print(f"Global window size determined: {window_size}")
     for i in range(records_to_process):
-        X_record, y_record = get_data(data_dir, sample_select=i, stage=stage)
+        X_record, y_record = get_data(data_dir, sample_select=i, stage=stage, window_size=window_size)
         if len(X_record) > 0:
             X_all.append(X_record)
             y_all.append(y_record)
@@ -120,14 +173,16 @@ def load_data(data_dir: str, num_records: int, random_seed: int, stage: str):
             valid_indices.extend(patient_cls_idx)
 
     valid_indices = np.sort(valid_indices)
-    return X_master[valid_indices], y_master[valid_indices], groups_master[valid_indices]
+    return X_master[valid_indices], y_master[valid_indices], groups_master[valid_indices], window_size
 
 
 def train_binary_stage(args):
     print("STAGE 1: BINARY CLASSIFICATION (Normal vs. Abnormal)")
 
-    X_data, y_labels, groups = load_data(args.data_dir, args.selected_samples, args.random_seed, stage="binary")
+    X_data, y_labels, groups, window_size = load_data(args.data_dir, args.selected_samples, args.random_seed, stage="binary")
     X_data = X_data.astype(np.float32)
+
+    samples_plot(X_data, y_labels, encoder=None, stage="binary", random_state=args.random_seed)
 
     os.makedirs("outputs", exist_ok=True)
 
@@ -157,13 +212,13 @@ def train_binary_stage(args):
         X_test_scaled = scaler.transform(X_test_raw)
         joblib.dump(scaler, f"outputs/scaler_fold_{fold_number}_binary.pkl")
 
-        X_train_w = X_train_scaled.reshape(-1, args.window, 1)
-        X_test_w = X_test_scaled.reshape(-1, args.window, 1)
+        X_train_w = X_train_scaled.reshape(-1, window_size, 1)
+        X_test_w = X_test_scaled.reshape(-1, window_size, 1)
 
         y_train_bin = y_train_raw.astype(np.float32).reshape(-1, 1)
         y_test_bin = y_test_raw.astype(np.float32).reshape(-1, 1)
 
-        model = build_inception_conformer(input_shape=(args.window, 1), n_classes=num_classes, stage="binary")
+        model = build_inception_conformer(window_size=window_size, n_classes=num_classes, stage="binary")
         steps_per_epoch = len(X_train_w) // args.batch_size
         total_steps = steps_per_epoch * args.epochs
         warmup_steps = int(0.1 * total_steps)
@@ -179,7 +234,7 @@ def train_binary_stage(args):
         focal_loss = tf.keras.losses.BinaryFocalCrossentropy(
             alpha=0.25,
             gamma=1,
-            #label_smoothing=0.05,
+            # label_smoothing=0.05
         )
 
         model.compile(
@@ -231,7 +286,7 @@ def train_binary_stage(args):
                 y_test_raw,
                 y_pred_probs,
             )
-        except Exception as exc:  # pragma: no cover - defensive path
+        except Exception as exc:  # pragma: no cover
             print(f"Warning: Failed to calculate weighted AUC for fold {fold_number}: {exc}")
             best_val_auc = 0.5
 
@@ -311,7 +366,7 @@ def train_binary_stage(args):
 def train_multiclass_stage(args):
     print("STAGE 2: MULTICLASS CLASSIFICATION")
 
-    X_data, y_labels, groups = load_data(args.data_dir, args.selected_samples, args.random_seed, stage="multiclass")
+    X_data, y_labels, groups, window_size = load_data(args.data_dir, args.selected_samples, args.random_seed, stage="multiclass")
     X_data = X_data.astype(np.float32)
 
     os.makedirs("outputs", exist_ok=True)
@@ -321,6 +376,8 @@ def train_multiclass_stage(args):
     num_classes = len(encoder.classes_)
 
     joblib.dump(encoder, "outputs/label_encoder.pkl")
+
+    samples_plot(X_data, y_encoded, encoder=encoder, stage="multiclass", random_state=args.random_seed)
 
     print(f"\nTotal extracted windows: {len(X_data)}")
     print(f"Detected {num_classes} distinct classes: {encoder.classes_}")
@@ -345,13 +402,13 @@ def train_multiclass_stage(args):
         X_test_scaled = scaler.transform(X_test_raw)
         joblib.dump(scaler, f"outputs/scaler_fold_{fold_number}.pkl")
 
-        X_train_w = X_train_scaled.reshape(-1, args.window, 1)
-        X_test_w = X_test_scaled.reshape(-1, args.window, 1)
+        X_train_w = X_train_scaled.reshape(-1, window_size, 1)
+        X_test_w = X_test_scaled.reshape(-1, window_size, 1)
 
         y_train_cat = to_categorical(y_train_raw, num_classes=num_classes)
         y_test_cat = to_categorical(y_test_raw, num_classes=num_classes)
 
-        model = build_inception_conformer(input_shape=(args.window, 1), n_classes=num_classes, stage="multiclass")
+        model = build_inception_conformer(window_size=window_size, n_classes=num_classes, stage="multiclass")
         steps_per_epoch = len(X_train_w) // args.batch_size
         total_steps = steps_per_epoch * args.epochs
         warmup_steps = int(0.1 * total_steps)
@@ -422,7 +479,7 @@ def train_multiclass_stage(args):
                 average="weighted",
                 multi_class="ovr",
             )
-        except Exception as exc:  # pragma: no cover - defensive path
+        except Exception as exc:  # pragma: no cover
             print(f"Warning: Failed to calculate weighted AUC for fold {fold_number}: {exc}")
             best_val_auc = 0.5
 
@@ -512,7 +569,6 @@ def main():
     args = parser.parse_args()
 
     mlflow.log_params({
-        "window_size": args.window,
         "epochs": args.epochs,
         "selected_samples": args.selected_samples,
         "random_seed": args.random_seed,

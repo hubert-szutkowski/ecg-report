@@ -93,7 +93,7 @@ def load_all_multiclass_data(data_dir: str, num_records: int, random_seed: int):
     if len(y_master) == 0:
         return X_master, y_master, groups_master
 
-    #Dynamic downsampling based on IQR to handle class imbalance and patient-level outliers
+    # IQR downsampling
     rng = np.random.default_rng(random_seed)
     valid_indices = []
     
@@ -173,7 +173,7 @@ for train_idx, test_idx in sgkf.split(X_DATA, Y_ENCODED, GROUPS):
     print(f"Computed Multiclass Weights: {class_weight_dict}")
 
     model = build_inception_conformer(input_shape=(args.window, 1), n_classes=NUM_CLASSES)
-    #For Cosine Decay
+    # Cosine decay
     steps_per_epoch = len(X_train_w) // args.batch_size
     total_steps = steps_per_epoch * args.epochs
 
@@ -201,7 +201,7 @@ for train_idx, test_idx in sgkf.split(X_DATA, Y_ENCODED, GROUPS):
 
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=10, min_delta=1e-4, restore_best_weights=True, verbose=1),
-        # ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-6, verbose=1),
+        # ReduceLROnPlateau
         ModelCheckpoint(filepath=f'outputs/best_model_fold_{fold_number}.keras', monitor='val_loss', save_best_only=True, verbose=1),
         MLflowFoldCallback(fold_num=fold_number)
     ]
@@ -224,7 +224,7 @@ for train_idx, test_idx in sgkf.split(X_DATA, Y_ENCODED, GROUPS):
         train_dataset,
         epochs=args.epochs,
         validation_data=val_dataset,
-        #class_weight=class_weight_dict,
+        # class_weight=class_weight_dict,
         callbacks=callbacks,
         verbose=1
     )

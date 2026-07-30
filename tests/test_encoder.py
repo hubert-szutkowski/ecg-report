@@ -25,9 +25,9 @@ def test_label_encoding_and_one_hot_conversion():
     num_classes = len(encoder.classes_)
     y_categorical = to_categorical(y_encoded, num_classes=num_classes)
     
-    # Assert dimensions: 6 rows (samples), 3 columns (classes)
+    # Check output shape
     assert y_categorical.shape == (6, 3), f"Expected shape (6, 3), got {y_categorical.shape}"
     
-    # Verify that each row sums up to exactly 1.0 (valid probability distribution)
+    # Check row sums
     row_sums = np.sum(y_categorical, axis=1)
     np.testing.assert_array_almost_equal(row_sums, np.ones(6))
