@@ -7,3 +7,4 @@ wfdb
 requests
 scikit-learn
 joblib
+scipy

@@ -5,18 +5,105 @@ import wfdb
 import plotly.graph_objects as go
 import numpy as np
 import plotly.express as px
+import tempfile
+from pathlib import Path
 
-# Environment configuration
-API_URL = "http://localhost:8000/predict_from_physionet"
+API_URL = "http://localhost:8000/predict_from_upload"
+WINDOW_SIZE = 216
 
 st.set_page_config(layout="wide", page_title="ECG Analytics Dashboard")
 
+def render_styled_metrics(total_windows, df_anomalies):
+    """
+    Render custom KPI cards using HTML/CSS instead of default Streamlit metrics.
+    """
+    count_F = len(df_anomalies[df_anomalies["predicted_class"] == 0])
+    count_Q = len(df_anomalies[df_anomalies["predicted_class"] == 1])
+    count_S = len(df_anomalies[df_anomalies["predicted_class"] == 2])
+    count_V = len(df_anomalies[df_anomalies["predicted_class"] == 3])
+
+    html_content = f"""
+    <div style="display: flex; gap: 15px; margin-bottom: 20px;">
+        <div style="flex: 1; padding: 15px; border-radius: 6px; background-color: #262730; color: #FAFAFA; border-left: 6px solid #888;">
+            <div style="font-size: 0.9rem; color: #ccc;">All windows</div>
+            <div style="font-size: 1.8rem; font-weight: bold;">{total_windows}</div>
+        </div>
+        <div style="flex: 1; padding: 15px; border-radius: 6px; background-color: #262730; color: #FAFAFA; border-left: 6px solid #FF4B4B;">
+            <div style="font-size: 0.9rem; color: #ccc;">Class F (Fusion)</div>
+            <div style="font-size: 1.8rem; font-weight: bold;">{count_F}</div>
+        </div>
+        <div style="flex: 1; padding: 15px; border-radius: 6px; background-color: #262730; color: #FAFAFA; border-left: 6px solid #FFA500;">
+            <div style="font-size: 0.9rem; color: #ccc;">Class Q (Unknown)</div>
+            <div style="font-size: 1.8rem; font-weight: bold;">{count_Q}</div>
+        </div>
+        <div style="flex: 1; padding: 15px; border-radius: 6px; background-color: #262730; color: #FAFAFA; border-left: 6px solid #1E90FF;">
+            <div style="font-size: 0.9rem; color: #ccc;">Class S (Supraventricular)</div>
+            <div style="font-size: 1.8rem; font-weight: bold;">{count_S}</div>
+        </div>
+        <div style="flex: 1; padding: 15px; border-radius: 6px; background-color: #262730; color: #FAFAFA; border-left: 6px solid #8A2BE2;">
+            <div style="font-size: 0.9rem; color: #ccc;">Class V (Ventricular)</div>
+            <div style="font-size: 1.8rem; font-weight: bold;">{count_V}</div>
+        </div>
+    </div>
+    """
+    st.markdown(html_content, unsafe_allow_html=True)
 
 @st.fragment
-def render_interactive_viewer(signal, fs, predictions, total_duration, stride):
+def render_morphology_viewer(signal, anomalies_df):
     """
-    Isolated UI component. Changing the slider or selectbox only reruns this function.
+    Overlay beats from the selected class to visualize morphology variance.
     """
+    st.markdown("**Morphology analysis (Beat Template Overlay)**")
+    
+    if anomalies_df.empty:
+        st.info("No anomalies available for morphology analysis.")
+        return
+
+    available_classes = anomalies_df["Visual_Label"].unique()
+    selected_label = st.selectbox("Select class", available_classes, label_visibility="collapsed")
+    
+    subset = anomalies_df[anomalies_df["Visual_Label"] == selected_label]
+    
+    fig = go.Figure()
+    all_beats = []
+    
+    for _, row in subset.iterrows():
+        start = int(row["start_sample"])
+        w_size = int(row["window_size"])
+        
+        if start >= 0 and start + w_size < len(signal):
+            beat = signal[start : start + w_size]
+            all_beats.append(beat)
+            
+            fig.add_trace(go.Scatter(
+                y=beat, mode="lines",
+                line=dict(color="gray", width=1),
+                opacity=0.15,
+                hoverinfo="skip"
+            ))
+            
+    if all_beats:
+        mean_beat = np.mean(all_beats, axis=0)
+        fig.add_trace(go.Scatter(
+            y=mean_beat, mode="lines",
+            name="Mean morphology",
+            line=dict(color="black", width=3)
+        ))
+
+    fig.update_layout(
+        height=300,
+        margin=dict(l=0, r=0, t=10, b=0),
+        showlegend=False,
+        plot_bgcolor='white',
+        xaxis=dict(showgrid=False, zeroline=False, visible=False),
+        yaxis=dict(showgrid=True, gridcolor='#eee', zeroline=False, title="Amplitude")
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+
+@st.fragment
+def render_interactive_viewer(signal, fs, predictions, total_duration):
     col_title, col_width = st.columns([3, 1])
     with col_title:
         st.subheader("Signal visualization with predictions")
@@ -29,9 +116,9 @@ def render_interactive_viewer(signal, fs, predictions, total_duration, stride):
         "View start [s]",
         min_value=0.0,
         max_value=float(total_duration),
-        value=0.0,
         step=1.0,
         label_visibility="collapsed",
+        key="chart_start_slider"
     )
 
     fig = plot_signal_segment(
@@ -40,58 +127,69 @@ def render_interactive_viewer(signal, fs, predictions, total_duration, stride):
         predictions=predictions,
         start_sec=start_sec,
         duration_sec=duration_sec,
-        window_size=stride,
+        window_size=WINDOW_SIZE,
     )
 
     chart_placeholder.plotly_chart(fig, use_container_width=True)
 
 
-@st.cache_data
-def load_signal(record_name: str, pn_dir: str, channel: int):
-    """
-    Loads a signal from the PhysioNet database.
-    The data are cached in memory so the navigation slider does not
-    force repeated downloads over the network.
-    """
+def load_signal_from_upload(hea_bytes: bytes, dat_bytes: bytes, base_name: str, channel: int):
     try:
-        record = wfdb.rdrecord(record_name, pn_dir=pn_dir)
-        signal = record.p_signal[:, channel]
-        fs = record.fs
-        return signal, fs
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            (tmp_path / f"{base_name}.hea").write_bytes(hea_bytes)
+            (tmp_path / f"{base_name}.dat").write_bytes(dat_bytes)
+
+            record = wfdb.rdrecord(str(tmp_path / base_name))
+            signal = record.p_signal[:, channel]
+            fs = record.fs
+            return signal, fs
     except Exception as e:
-        st.error(f"Error loading data from WFDB: {e}")
+        st.error(f"Error loading uploaded WFDB files: {e}")
         return None, None
 
-
-def fetch_predictions(record_name: str, pn_dir: str, channel: int, stride: int):
-    """
-    Sends a POST request with a JSON payload to the FastAPI container.
-    """
-    payload = {
-        "record_name": record_name,
-        "pn_dir": pn_dir,
-        "channel": channel,
-        "stride": stride,
+def fetch_predictions_from_upload(hea_file, dat_file, channel: int):
+    files = {
+        "hea_file": (hea_file.name, hea_file.getvalue(), "application/octet-stream"),
+        "dat_file": (dat_file.name, dat_file.getvalue(), "application/octet-stream"),
     }
-
-    response = requests.post(API_URL, json=payload, timeout=30)
+    data = {"channel": str(channel)}
+    response = requests.post(API_URL, files=files, data=data, timeout=30)
 
     if response.status_code == 503:
         st.error("Service unavailable: the model or scaler has not been loaded into container memory.")
         return None
     if response.status_code == 400:
-        st.error(f"PhysioNet data retrieval error on the backend: {response.json().get('detail')}")
+        st.error(f"Uploaded file error on the backend: {response.json().get('detail')}")
         return None
 
     response.raise_for_status()
     return response.json()
 
+def normalize_api_predictions(preds):
+    if not isinstance(preds, dict):
+        return preds
+    results = preds.get("results", preds)
+    if not isinstance(results, list):
+        return preds
+
+    normalized = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        peak_sample = item.get("peak_sample")
+        normalized.append(
+            {
+                **item,
+                "window_index": item.get("beat_index"),
+                "start_sample": None if peak_sample is None else int(peak_sample) - (WINDOW_SIZE // 2),
+                "window_size": WINDOW_SIZE,
+            }
+        )
+    return normalized
+
 
 def plot_signal_segment(signal, fs, predictions, start_sec, duration_sec, window_size):
-    """
-    Renders an ECG signal segment with prediction windows overlaid.
-    Uses the 'is_anomaly' key for filtering and maps class IDs to text labels.
-    """
     start_idx = int(start_sec * fs)
     end_idx = int((start_sec + duration_sec) * fs)
     end_idx = min(end_idx, len(signal))
@@ -100,20 +198,18 @@ def plot_signal_segment(signal, fs, predictions, start_sec, duration_sec, window
     x_data = np.arange(start_idx, end_idx) / fs
 
     fig = go.Figure()
+    
     fig.add_trace(
         go.Scatter(
             x=x_data,
             y=y_data,
             mode="lines",
             name="ECG signal",
-            line=dict(color="black", width=1),
+            line=dict(color="black", width=1.5),
         )
     )
 
-    # Visual configuration
-    color_map = {0: "red", 1: "orange", 2: "blue", 3: "purple"}
-
-    # Class mapping according to the selected notation
+    color_map = {0: "#FF4B4B", 1: "#FFA500", 2: "#1E90FF", 3: "#8A2BE2"}
     label_map = {0: "F", 1: "Q", 2: "S", 3: "V"}
 
     for pred in predictions:
@@ -124,191 +220,210 @@ def plot_signal_segment(signal, fs, predictions, start_sec, duration_sec, window
         w_end = w_start + window_size
 
         if w_end > start_idx and w_start < end_idx:
-            # API contract key: 'is_anomaly'
             if not pred.get("is_anomaly", False):
                 continue
-
             p_class = pred.get("predicted_class")
             if p_class is None or str(p_class).strip().lower() == "none":
                 continue
 
             color = color_map.get(p_class, "gray")
-            # Get the text label; if the class is missing from the mapping, fall back to the class ID
-            label_text = label_map.get(p_class, f"Class {p_class}")
+            label_text = label_map.get(p_class, f"{p_class}")
 
             x0_sec = max(w_start, start_idx) / fs
             x1_sec = min(w_end, end_idx) / fs
 
-            fig.add_vrect(
-                x0=x0_sec,
-                x1=x1_sec,
+            fig.add_shape(
+                type="rect",
+                xref="x", yref="paper",
+                x0=x0_sec, x1=x1_sec,
+                y0=0.0, y1=0.05,
                 fillcolor=color,
-                opacity=0.3,
-                layer="below",
-                line_width=1,
-                line_color=color,
-                annotation_text=label_text,
-                annotation_position="top left",
+                line_width=0,
+                layer="above"
+            )
+            
+            fig.add_annotation(
+                x=x0_sec, y=0.07, xref="x", yref="paper",
+                text=label_text, showarrow=False,
+                font=dict(color=color, size=11, family="Arial Black"),
+                xanchor="left"
             )
 
     fig.update_layout(
         height=500,
-        xaxis_title="Time [s]",
-        yaxis_title="Amplitude [mV]",
+        plot_bgcolor='white',
+        xaxis=dict(
+            title="Time [s]",
+            tickmode='linear',
+            dtick=0.2,
+            minor=dict(dtick=0.04, gridcolor='rgba(255, 100, 100, 0.3)', gridwidth=1),
+            gridcolor='rgba(255, 100, 100, 0.7)',
+            gridwidth=1.5,
+            zeroline=False,
+            showgrid=True
+        ),
+        yaxis=dict(
+            title="Amplitude [mV]",
+            tickmode='linear',
+            dtick=0.5,
+            minor=dict(dtick=0.1, gridcolor='rgba(255, 100, 100, 0.3)', gridwidth=1),
+            gridcolor='rgba(255, 100, 100, 0.7)',
+            gridwidth=1.5,
+            zeroline=False,
+            showgrid=True
+        ),
         margin=dict(l=0, r=0, t=30, b=0),
         showlegend=False,
     )
     return fig
 
 
-# --- Main application interface ---
-
-st.title("Analytical Interface: Inception-Conformer ECG")
+st.title("Clinical Interface: Inception-Conformer ECG")
 
 with st.sidebar:
-    st.header("Input parameters")
-    record_name = st.text_input("Record name", value="100")
-    pn_dir = st.text_input("Directory", value="mitdb")
+    st.header("Input configuration")
     channel = st.number_input("Channel", min_value=0, max_value=5, value=0, step=1)
-    stride = st.number_input("Window step (stride)", min_value=10, max_value=2000, value=216, step=1)
-
+    uploaded_files = st.file_uploader(
+        "Upload WFDB files (.hea and .dat)",
+        type=["hea", "dat"],
+        accept_multiple_files=True,
+    )
     run_btn = st.button("Run API prediction", type="primary")
 
-# Session state initialization
 if "predictions" not in st.session_state:
     st.session_state.predictions = None
-    st.session_state.current_record = None
+    st.session_state.current_signal = None
+    st.session_state.current_fs = None
+if "chart_start_slider" not in st.session_state:
+    st.session_state.chart_start_slider = 0.0
+if "last_selected_row" not in st.session_state:
+    st.session_state.last_selected_row = None
 
-# Run button handling
 if run_btn:
-    with st.spinner("Querying the FastAPI container..."):
+    with st.spinner("Processing FastAPI container..."):
         try:
-            preds = fetch_predictions(record_name, pn_dir, channel, stride)
-            if preds:
-                # Unwrap any top-level key depending on the StreamResponse format
-                # Analyze and normalize the response structure
-                normalized_preds = preds
+            if not uploaded_files or len(uploaded_files) != 2:
+                st.error("Upload exactly two files: one .hea and one .dat.")
+                st.stop()
 
-                if isinstance(preds, dict):
-                    # If this is a single window (a dictionary with model keys), force a list
-                    if "start_sample" in preds:
-                        normalized_preds = [preds]
-                    # Check the most common keys for result lists
-                    elif "predictions" in preds:
-                        normalized_preds = preds["predictions"]
-                    elif "results" in preds:
-                        normalized_preds = preds["results"]
-                    elif "data" in preds:
-                        normalized_preds = preds["data"]
+            file_map = {Path(file.name).suffix.lower(): file for file in uploaded_files}
+            hea_file = file_map.get(".hea")
+            dat_file = file_map.get(".dat")
 
-                # Type guard before passing data to the chart
-                if not isinstance(normalized_preds, list):
-                    st.error(
-                        f"Critical data structure error. Expected a list, got: {type(normalized_preds).__name__}"
-                    )
-                    st.write("Raw API object snapshot:", preds)
-                    st.stop()  # Stops further UI rendering and prevents a TypeError
+            if hea_file is None or dat_file is None:
+                st.error("Upload both a .hea file and a .dat file.")
+                st.stop()
 
-                st.session_state.predictions = normalized_preds
-                st.session_state.current_record = (record_name, pn_dir, channel)
-                st.success("Inference completed successfully.")
+            preds = fetch_predictions_from_upload(hea_file, dat_file, channel)
+            if not preds:
+                st.stop()
+
+            normalized_preds = normalize_api_predictions(preds)
+            if not isinstance(normalized_preds, list):
+                st.error(f"Critical data structure error. Expected a list, got: {type(normalized_preds).__name__}")
+                st.stop()
+
+            signal, fs = load_signal_from_upload(
+                hea_file.getvalue(),
+                dat_file.getvalue(),
+                Path(hea_file.name).stem,
+                channel,
+            )
+
+            if signal is not None:
+                st.session_state.current_signal = signal
+                st.session_state.current_fs = fs
+
+            st.session_state.predictions = normalized_preds
+            st.session_state.chart_start_slider = 0.0
+            st.session_state.last_selected_row = None
+            st.success("Inference completed.")
+            
         except requests.exceptions.ConnectionError:
             st.error("Connection refused. Check whether the backend container is running on port 8000.")
         except Exception as e:
             st.error(f"Critical communication error: {e}")
 
-# Display results if they are present in the session
-if st.session_state.predictions and st.session_state.current_record:
-    curr_record_name, curr_pn_dir, curr_channel = st.session_state.current_record
+if st.session_state.predictions and st.session_state.current_signal is not None and st.session_state.current_fs is not None:
+    signal = st.session_state.current_signal
+    fs = st.session_state.current_fs
+    total_duration = len(signal) / fs
 
-    signal, fs = load_signal(curr_record_name, curr_pn_dir, curr_channel)
-
-    if signal is not None:
-        total_duration = len(signal) / fs
-
-        # Call the isolated fragment
-        render_interactive_viewer(
-            signal=signal,
-            fs=fs,
-            predictions=st.session_state.predictions,
-            total_duration=total_duration,
-            stride=stride,
-        )
-
-        # Data availability guard
-if st.session_state.predictions:
-    st.markdown("---")
-    st.subheader("Statistics and detection analysis")
-
-    # Convert to a DataFrame for fast vectorized aggregation
     df = pd.DataFrame(st.session_state.predictions)
-
-    # Metrics panel (KPI)
-    total_windows = len(df)
-    # Extract only anomalies for detailed analysis
     anomalies_df = df[df["is_anomaly"] == True].copy()
-    anomalies_count = len(anomalies_df)
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Analyzed windows", total_windows)
-    col2.metric("Detected anomalies", anomalies_count)
-    col3.metric(
-        "Anomaly rate",
-        f"{(anomalies_count / total_windows) * 100:.1f}%" if total_windows > 0 else "0%",
-    )
-
-    st.write("")  # Spacer
-
-    # Detailed analysis panel (chart + table)
-    col_pie, col_table = st.columns([1, 1.5])
-
+    
+    display_df = pd.DataFrame()
     if not anomalies_df.empty:
-        # Base mapping for logic and charts
-        label_map = {0: "F", 1: "Q", 2: "S", 3: "V"}
-        anomalies_df["Label"] = anomalies_df["predicted_class"].map(label_map)
-
-        # UI mapping with Unicode glyphs (colored squares)
-        # Red, orange, blue, purple
         ui_label_map = {0: "🟥 F", 1: "🟧 Q", 2: "🟦 S", 3: "🟪 V"}
         anomalies_df["Visual_Label"] = anomalies_df["predicted_class"].map(ui_label_map)
+        anomalies_df["time_sec"] = anomalies_df["start_sample"] / fs
+        
+        display_df = anomalies_df[
+            ["window_index", "time_sec", "start_sample", "window_size", "binary_anomaly_probability", "Visual_Label"]
+        ].reset_index(drop=True)
 
-        # Left column: pie chart
+    if "anomaly_table" in st.session_state:
+        selected_rows = st.session_state.anomaly_table.get("selection", {}).get("rows", [])
+        current_selection = selected_rows[0] if selected_rows else None
+        
+        if current_selection is not None and current_selection != st.session_state.last_selected_row:
+            selected_sec = display_df.iloc[current_selection]["time_sec"]
+            st.session_state.chart_start_slider = max(0.0, float(selected_sec) - 1.0)
+            st.session_state.last_selected_row = current_selection
+        elif not selected_rows:
+            st.session_state.last_selected_row = None
+
+    render_interactive_viewer(
+        signal=signal,
+        fs=fs,
+        predictions=st.session_state.predictions,
+        total_duration=total_duration,
+    )
+
+    st.markdown("---")
+    
+    render_styled_metrics(len(df), anomalies_df)
+
+    if not display_df.empty:
+        col_pie, col_table = st.columns([1, 1.5])
+        
         with col_pie:
-            st.markdown("**Anomaly type distribution**")
+            st.markdown("**Arrhythmia type distribution**")
+            label_map = {0: "F", 1: "Q", 2: "S", 3: "V"}
+            anomalies_df["Label"] = anomalies_df["predicted_class"].map(label_map)
             fig_pie = px.pie(
                 anomalies_df,
                 names="Label",
                 hole=0.4,
-                color_discrete_sequence=["red", "orange", "blue", "purple"],
+                color_discrete_map={"F":"#FF4B4B", "Q":"#FFA500", "S":"#1E90FF", "V":"#8A2BE2"},
             )
-            fig_pie.update_layout(margin=dict(t=20, b=0, l=0, r=0))
+            fig_pie.update_layout(margin=dict(t=10, b=0, l=0, r=0), height=250)
             st.plotly_chart(fig_pie, use_container_width=True)
 
-        # Right column: formatted table
+            st.markdown("---")
+            render_morphology_viewer(signal, display_df)
+
         with col_table:
-            st.markdown("**Detected events register**")
-
-            # Use the column with embedded Unicode squares
-            display_df = anomalies_df[
-                ["window_index", "start_sample", "binary_anomaly_probability", "Visual_Label"]
-            ].copy()
-
+            st.markdown("**Event log**")
+            table_view = display_df.drop(columns=["window_size"])
+            
             st.dataframe(
-                display_df,
+                table_view,
+                key="anomaly_table",
+                on_select="rerun",
+                selection_mode="single-row",
                 column_config={
                     "window_index": "Window ID",
-                    "start_sample": "Start sample",
+                    "time_sec": st.column_config.NumberColumn("Time [s]", format="%.3f"),
+                    "start_sample": "Sample index",
                     "binary_anomaly_probability": st.column_config.ProgressColumn(
-                        "Detection confidence",
-                        format="%.2f",
-                        min_value=0,
-                        max_value=1,
+                        "Detection confidence", format="%.2f", min_value=0, max_value=1
                     ),
-                    "Visual_Label": "Class",
+                    "Visual_Label": "Classification",
                 },
                 hide_index=True,
                 use_container_width=True,
-                height=350,
+                height=550,
             )
     else:
-        st.success("No anomalies were found in the analyzed signal.")
+        st.success("No anomalies were found in the analyzed signal segment.")

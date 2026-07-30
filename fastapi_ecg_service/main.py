@@ -1,19 +1,18 @@
 # fastapi_ecg_service/main.py
-import joblib
+
 import logging
-import pickle
 import tempfile
 from pathlib import Path
-from urllib.parse import urlparse
 
+import joblib
 import numpy as np
-import requests
 import tensorflow as tf
 import wfdb
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel
 
 from src.AAMI_classification_multistages.multistage_model import PositionalEmbedding
+from .pan_tompkins import pan_tompkins_detect
 
 WEIGHTS_DIR = Path("/app/weights")
 BINARY_PATH = WEIGHTS_DIR / "ecg_binary_model.keras"
@@ -21,7 +20,7 @@ MULTICLASS_PATH = WEIGHTS_DIR / "ecg_multiclass_model.keras"
 SCALER_PATH = WEIGHTS_DIR / "scaler.pkl"
 
 WINDOW_SIZE = 216
-DEFAULT_STRIDE = 216
+HALF_WINDOW = WINDOW_SIZE // 2
 BINARY_THRESHOLD = 0.5
 
 CUSTOM_OBJECTS = {"PositionalEmbedding": PositionalEmbedding}
@@ -31,8 +30,8 @@ logger = logging.getLogger("ecg_service")
 
 app = FastAPI(
     title="ECG Inception-Conformer Classifier",
-    description="Two-stage ECG classification: binary anomaly detection + multiclass cascade.",
-    version="1.4.0",
+    description="Two-stage ECG classification from uploaded WFDB .hea/.dat files, with Pan-Tompkins R-peak detection.",
+    version="3.0.0",
 )
 
 binary_model: tf.keras.Model | None = None
@@ -71,36 +70,38 @@ def load_models() -> None:
     logger.info("Startup complete.")
 
 
-# --- Normalization + inference ---
+# --- Windowing (must match training exactly) ---
+
+def extract_windows_around_peaks(signal: np.ndarray, peak_indices: np.ndarray, window_size: int = WINDOW_SIZE):
+    half_window = window_size // 2
+    n_samples = len(signal)
+    windows = []
+    valid_peaks = []
+    for peak in peak_indices:
+        start = int(peak) - half_window
+        end = start + window_size
+        if start >= 0 and end <= n_samples:
+            windows.append(signal[start:end])
+            valid_peaks.append(int(peak))
+    if not windows:
+        return np.empty((0, window_size), dtype=np.float32), np.empty((0,), dtype=int)
+    return np.stack(windows).astype(np.float32), np.array(valid_peaks)
+
 
 def normalize_windows(windows_raw: np.ndarray) -> np.ndarray:
-    # windows_raw: shape (n_windows, WINDOW_SIZE) — scaler.transform, never fit
     return scaler.transform(windows_raw).astype(np.float32)
 
 
-def run_cascade(window_raw: np.ndarray) -> dict:
-    normalized = normalize_windows(window_raw.reshape(1, WINDOW_SIZE))
-    x = normalized.reshape(1, WINDOW_SIZE, 1)
-
-    binary_prob = float(binary_model.predict(x, verbose=0)[0][0])
-    is_anomaly = binary_prob >= BINARY_THRESHOLD
-
-    result = {"binary_anomaly_probability": binary_prob, "is_anomaly": is_anomaly}
-    if is_anomaly and multiclass_model is not None:
-        class_probs = multiclass_model.predict(x, verbose=0)[0]
-        result["multiclass_probabilities"] = class_probs.tolist()
-        result["predicted_class"] = int(np.argmax(class_probs))
-    return result
-
-
-def run_stream(signal_raw: np.ndarray, stride: int) -> "StreamResponse":
-    if len(signal_raw) < WINDOW_SIZE:
-        raise HTTPException(status_code=400, detail=f"Signal must have at least {WINDOW_SIZE} samples.")
-    if not np.all(np.isfinite(signal_raw)):
+def run_cascade_batch(signal: np.ndarray, fs: float) -> "BeatStreamResponse":
+    if not np.all(np.isfinite(signal)):
         raise HTTPException(status_code=400, detail="Signal contains NaN or infinite values.")
 
-    starts = list(range(0, len(signal_raw) - WINDOW_SIZE + 1, stride))
-    windows_raw = np.stack([signal_raw[s: s + WINDOW_SIZE] for s in starts])
+    peak_indices = pan_tompkins_detect(signal, fs)
+    logger.info("Pan-Tompkins detected %d candidate peaks", len(peak_indices))
+
+    windows_raw, valid_peaks = extract_windows_around_peaks(signal, peak_indices)
+    if len(valid_peaks) == 0:
+        raise HTTPException(status_code=400, detail="No valid beats found (peaks too close to signal boundaries).")
 
     try:
         windows_normalized = normalize_windows(windows_raw)
@@ -109,9 +110,7 @@ def run_stream(signal_raw: np.ndarray, stride: int) -> "StreamResponse":
         raise HTTPException(status_code=500, detail="Internal error during signal normalization.") from exc
 
     x_all = windows_normalized.reshape(-1, WINDOW_SIZE, 1)
-    n_windows = len(starts)
 
-    logger.info("Running binary model on %d windows (batched)", n_windows)
     try:
         binary_probs = binary_model.predict(x_all, batch_size=256, verbose=0).flatten()
     except Exception as exc:
@@ -125,131 +124,67 @@ def run_stream(signal_raw: np.ndarray, stride: int) -> "StreamResponse":
 
     if multiclass_model is not None and is_anomaly_mask.any():
         anomaly_indices = np.where(is_anomaly_mask)[0]
-        logger.info("Running multiclass model on %d anomalous windows (batched)", len(anomaly_indices))
         try:
-            x_anomaly = x_all[anomaly_indices]
-            class_probs_batch = multiclass_model.predict(x_anomaly, batch_size=256, verbose=0)
+            class_probs_batch = multiclass_model.predict(x_all[anomaly_indices], batch_size=256, verbose=0)
         except Exception as exc:
             logger.exception("Batched multiclass inference failed")
             raise HTTPException(status_code=500, detail="Internal error during multiclass prediction.") from exc
 
         for i, idx in enumerate(anomaly_indices):
-            probs = class_probs_batch[i].tolist()
-            multiclass_probs_by_index[int(idx)] = probs
+            multiclass_probs_by_index[int(idx)] = class_probs_batch[i].tolist()
             predicted_class_by_index[int(idx)] = int(np.argmax(class_probs_batch[i]))
 
-    results: list[WindowResult] = []
-    for window_index, start in enumerate(starts):
+    results: list[BeatResult] = []
+    for i, peak in enumerate(valid_peaks):
         results.append(
-            WindowResult(
-                window_index=window_index,
-                start_sample=start,
-                binary_anomaly_probability=float(binary_probs[window_index]),
-                is_anomaly=bool(is_anomaly_mask[window_index]),
-                multiclass_probabilities=multiclass_probs_by_index.get(window_index),
-                predicted_class=predicted_class_by_index.get(window_index),
+            BeatResult(
+                beat_index=i,
+                peak_sample=int(peak),
+                binary_anomaly_probability=float(binary_probs[i]),
+                is_anomaly=bool(is_anomaly_mask[i]),
+                multiclass_probabilities=multiclass_probs_by_index.get(i),
+                predicted_class=predicted_class_by_index.get(i),
             )
         )
 
-    logger.info("Stream complete: %d windows, %d anomalies", n_windows, int(is_anomaly_mask.sum()))
-    return StreamResponse(total_windows=n_windows, window_size=WINDOW_SIZE, stride=stride, results=results)
+    logger.info("Cascade complete: %d beats, %d anomalies", len(results), int(is_anomaly_mask.sum()))
+    return BeatStreamResponse(
+        total_beats=len(results),
+        detected_peaks=len(peak_indices),
+        window_size=WINDOW_SIZE,
+        fs=fs,
+        results=results,
+    )
 
 
-# --- wfdb loaders ---
-
-def load_from_physionet(record_name: str, pn_dir: str, channel: int = 0) -> np.ndarray:
-    record = wfdb.rdrecord(record_name, pn_dir=pn_dir)
-    return record.p_signal[:, channel].astype(np.float32)
-
-
-def load_from_url(hea_url: str, dat_url: str, channel: int = 0) -> np.ndarray:
-    base_name = Path(urlparse(hea_url).path).stem
-    if Path(urlparse(dat_url).path).stem != base_name:
-        raise ValueError(".hea and .dat file names must match (same record).")
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        for url, suffix in [(hea_url, ".hea"), (dat_url, ".dat")]:
-            resp = requests.get(url, timeout=30)
-            resp.raise_for_status()
-            (tmp_path / f"{base_name}{suffix}").write_bytes(resp.content)
-
-        record = wfdb.rdrecord(str(tmp_path / base_name))
-        return record.p_signal[:, channel].astype(np.float32)
-
-
-def load_from_bytes(hea_bytes: bytes, dat_bytes: bytes, base_name: str, channel: int = 0) -> np.ndarray:
+def load_from_bytes(hea_bytes: bytes, dat_bytes: bytes, base_name: str, channel: int = 0):
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
         (tmp_path / f"{base_name}.hea").write_bytes(hea_bytes)
         (tmp_path / f"{base_name}.dat").write_bytes(dat_bytes)
 
         record = wfdb.rdrecord(str(tmp_path / base_name))
-        return record.p_signal[:, channel].astype(np.float32)
+        signal = record.p_signal[:, channel].astype(np.float32)
+        return signal, record.fs
 
 
 # --- Schemas ---
 
-class PredictRequest(BaseModel):
-    signal: list[float] = Field(..., min_length=WINDOW_SIZE, max_length=WINDOW_SIZE)
-
-    @field_validator("signal")
-    @classmethod
-    def validate_finite(cls, value: list[float]) -> list[float]:
-        arr = np.asarray(value, dtype=np.float64)
-        if not np.all(np.isfinite(arr)):
-            raise ValueError("Signal contains NaN or infinite values.")
-        return value
-
-
-class SignalStreamRequest(BaseModel):
-    signal: list[float] = Field(..., min_length=WINDOW_SIZE)
-    stride: int = Field(default=DEFAULT_STRIDE, ge=1, le=WINDOW_SIZE)
-
-    @field_validator("signal")
-    @classmethod
-    def validate_finite(cls, value: list[float]) -> list[float]:
-        arr = np.asarray(value, dtype=np.float64)
-        if not np.all(np.isfinite(arr)):
-            raise ValueError("Signal contains NaN or infinite values.")
-        return value
-
-
-class PhysionetRequest(BaseModel):
-    record_name: str = Field(..., description="e.g. '100' for mitdb/100")
-    pn_dir: str = Field(..., description="e.g. 'mitdb'")
-    channel: int = Field(default=0, ge=0)
-    stride: int = Field(default=DEFAULT_STRIDE, ge=1, le=WINDOW_SIZE)
-
-
-class UrlSignalRequest(BaseModel):
-    hea_url: str
-    dat_url: str
-    channel: int = Field(default=0, ge=0)
-    stride: int = Field(default=DEFAULT_STRIDE, ge=1, le=WINDOW_SIZE)
-
-
-class WindowResult(BaseModel):
-    window_index: int
-    start_sample: int
+class BeatResult(BaseModel):
+    beat_index: int
+    peak_sample: int
     binary_anomaly_probability: float
     is_anomaly: bool
     multiclass_probabilities: list[float] | None = None
     predicted_class: int | None = None
 
 
-class StreamResponse(BaseModel):
-    total_windows: int
+class BeatStreamResponse(BaseModel):
+    total_beats: int
+    detected_peaks: int
     window_size: int
-    stride: int
-    results: list[WindowResult]
-
-
-class PredictResponse(BaseModel):
-    binary_anomaly_probability: float
-    is_anomaly: bool
-    multiclass_probabilities: list[float] | None = None
-    predicted_class: int | None = None
+    fs: float
+    results: list[BeatResult]
 
 
 class HealthResponse(BaseModel):
@@ -271,64 +206,12 @@ def health() -> HealthResponse:
     )
 
 
-@app.post("/predict", response_model=PredictResponse)
-def predict(request: PredictRequest) -> PredictResponse:
-    if binary_model is None or scaler is None:
-        raise HTTPException(status_code=503, detail="Model or scaler not loaded.")
-
-    window = np.asarray(request.signal, dtype=np.float32)
-    try:
-        result = run_cascade(window)
-    except Exception as exc:
-        logger.exception("Inference failed in /predict")
-        raise HTTPException(status_code=500, detail="Internal error during prediction.") from exc
-
-    return PredictResponse(**result)
-
-
-@app.post("/predict_stream", response_model=StreamResponse)
-def predict_stream(request: SignalStreamRequest) -> StreamResponse:
-    if binary_model is None or scaler is None:
-        raise HTTPException(status_code=503, detail="Model or scaler not loaded.")
-    signal = np.asarray(request.signal, dtype=np.float32)
-    return run_stream(signal, request.stride)
-
-
-@app.post("/predict_from_physionet", response_model=StreamResponse)
-def predict_from_physionet(request: PhysionetRequest) -> StreamResponse:
-    if binary_model is None or scaler is None:
-        raise HTTPException(status_code=503, detail="Model or scaler not loaded.")
-
-    try:
-        signal = load_from_physionet(request.record_name, request.pn_dir, request.channel)
-    except Exception as exc:
-        logger.exception("Failed to fetch record from PhysioNet")
-        raise HTTPException(status_code=400, detail=f"Could not fetch record: {exc}") from exc
-
-    return run_stream(signal, request.stride)
-
-
-@app.post("/predict_from_url", response_model=StreamResponse)
-def predict_from_url(request: UrlSignalRequest) -> StreamResponse:
-    if binary_model is None or scaler is None:
-        raise HTTPException(status_code=503, detail="Model or scaler not loaded.")
-
-    try:
-        signal = load_from_url(request.hea_url, request.dat_url, request.channel)
-    except Exception as exc:
-        logger.exception("Failed to fetch/load signal from URL")
-        raise HTTPException(status_code=400, detail=f"Could not fetch/load signal: {exc}") from exc
-
-    return run_stream(signal, request.stride)
-
-
-@app.post("/predict_from_upload", response_model=StreamResponse)
+@app.post("/predict_from_upload", response_model=BeatStreamResponse)
 async def predict_from_upload(
     hea_file: UploadFile = File(...),
     dat_file: UploadFile = File(...),
     channel: int = Form(0),
-    stride: int = Form(DEFAULT_STRIDE),
-) -> StreamResponse:
+) -> BeatStreamResponse:
     if binary_model is None or scaler is None:
         raise HTTPException(status_code=503, detail="Model or scaler not loaded.")
 
@@ -336,9 +219,9 @@ async def predict_from_upload(
     try:
         hea_bytes = await hea_file.read()
         dat_bytes = await dat_file.read()
-        signal = load_from_bytes(hea_bytes, dat_bytes, base_name, channel)
+        signal, fs = load_from_bytes(hea_bytes, dat_bytes, base_name, channel)
     except Exception as exc:
         logger.exception("Failed to load uploaded record")
         raise HTTPException(status_code=400, detail=f"Could not load uploaded files: {exc}") from exc
 
-    return run_stream(signal, stride)
+    return run_cascade_batch(signal, fs)
