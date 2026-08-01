@@ -16,49 +16,36 @@ class MinibatchStdDev(layers.Layer):
 
 
 def build_generator(window_size=216, latent_dim=100):
-    
     upsampling_factor = 2 ** 3
-    
-    
     base_length = int(np.ceil(window_size / upsampling_factor))
     generated_length = base_length * upsampling_factor
-    
+
     z = layers.Input(shape=(latent_dim,))
 
-    
     x = layers.Dense(base_length * 32)(z)
     x = layers.Reshape((base_length, 32))(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
-    # Block 1: x2
-    x = layers.UpSampling1D(2)(x)
-    x = layers.Conv1D(64, kernel_size=7, padding="same")(x)
+    x = layers.Conv1DTranspose(64, kernel_size=8, strides=2, padding="same")(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
     x = layers.Dropout(0.3)(x)
 
-    # Block 2: x2
-    x = layers.UpSampling1D(2)(x)
-    x = layers.Conv1D(32, kernel_size=5, padding="same")(x)
+    x = layers.Conv1DTranspose(32, kernel_size=6, strides=2, padding="same")(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
     x = layers.Dropout(0.3)(x)
 
-    # Block 3: x2
-    x = layers.UpSampling1D(2)(x)
-    x = layers.Conv1D(16, kernel_size=3, padding="same")(x)
+    x = layers.Conv1DTranspose(16, kernel_size=4, strides=2, padding="same")(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
-    
     if generated_length > window_size:
         crop_size = generated_length - window_size
         x = layers.Cropping1D(cropping=(0, crop_size))(x)
 
-    
     output = layers.Conv1D(1, kernel_size=3, padding="same", activation="linear")(x)
-    
     return Model(z, output, name="dynamic_slim_generator")
 
 def build_critic(input_shape=(216, 1)):
