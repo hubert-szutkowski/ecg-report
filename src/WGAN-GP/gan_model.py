@@ -2,6 +2,19 @@ import tensorflow as tf
 from tensorflow.keras import layers, models, Model, Sequential
 import numpy as np
 
+
+class MinibatchStdDev(layers.Layer):
+    def call(self, inputs):
+        mean = tf.reduce_mean(inputs, axis=0, keepdims=True)
+        variance = tf.reduce_mean(tf.square(inputs - mean), axis=0, keepdims=True)
+        stddev = tf.sqrt(variance + 1e-8)
+        mean_stddev = tf.reduce_mean(stddev)
+        shape = tf.shape(inputs)
+        feature_map = tf.fill([shape[0], shape[1], 1], mean_stddev)
+        return tf.concat([inputs, feature_map], axis=-1)
+
+
+
 def build_generator(window_size=216, latent_dim=100):
     
     upsampling_factor = 2 ** 3
@@ -65,6 +78,7 @@ def build_critic(input_shape=(216, 1)):
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
+    #x = MinibatchStdDev()(x)
     x = layers.Flatten()(x)
     x = layers.Dropout(0.3)(x)
     

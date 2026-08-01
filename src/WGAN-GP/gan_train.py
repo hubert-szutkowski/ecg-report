@@ -15,7 +15,7 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder, MinMaxScaler
 from sklearn.decomposition import PCA
 from tslearn.metrics import dtw
 from fastdtw import fastdtw
-
+from dtaidistance import dtw
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 MULTICLASS_DIR = os.path.join(os.path.dirname(CURRENT_DIR), "MultiClass")
@@ -49,30 +49,51 @@ mlflow.log_params({
     "model_type": "WGAN-GP_1D"
 })
 
-# def calculate_real_dtw_baseline(real_signals):
-#     """
-#     Compute pairwise DTW distances between all real signals and return mean, median, and std.
-#     """
-#     n_samples = real_signals.shape[0]
-#     dtw_distances = []
-    
-#     for idx1, idx2 in combinations(range(n_samples), 2):
-#         sig1 = real_signals[idx1].squeeze()
-#         sig2 = real_signals[idx2].squeeze()
-        
-#         distance, _ = fastdtw(sig1, sig2)
-#         dtw_distances.append(distance)
-#         print(f"Computed DTW between sample {idx1} and {idx2}: {distance:.4f}")
-        
-#     dtw_distances = np.array(dtw_distances)
-    
-#     metrics = {
-#         "mean_real_dtw": np.mean(dtw_distances),
-#         "median_real_dtw": np.median(dtw_distances),
-#         "std_real_dtw": np.std(dtw_distances)
-#     }
-    
-#     return metrics
+def _prepare(signals: np.ndarray) -> np.ndarray:
+    # dtaidistance requires float64, shape (n_samples, series_length)
+    return np.asarray([s.squeeze().astype(np.float64) for s in signals])
+
+
+def dtw_within_set(signals: np.ndarray, max_samples: int = 100, window: int | None = 20) -> dict:
+    """Mean/median/std of pairwise DTW within one set (real-real or synthetic-synthetic)."""
+    signals = _prepare(signals)
+    if len(signals) > max_samples:
+        idx = np.random.choice(len(signals), max_samples, replace=False)
+        signals = signals[idx]
+
+    dist_matrix = dtw.distance_matrix_fast(signals, window=window, parallel=True)
+    upper_triangle = dist_matrix[np.triu_indices(len(signals), k=1)]
+
+    return {
+        "mean": float(np.mean(upper_triangle)),
+        "median": float(np.median(upper_triangle)),
+        "std": float(np.std(upper_triangle)),
+        "n_pairs": len(upper_triangle),
+    }
+
+
+def dtw_cross_set(real_signals: np.ndarray, synthetic_signals: np.ndarray, max_samples: int = 100, window: int | None = 20) -> dict:
+    """Mean/median/std of pairwise DTW between two different sets (real vs synthetic)."""
+    real = _prepare(real_signals)
+    synth = _prepare(synthetic_signals)
+
+    if len(real) > max_samples:
+        real = real[np.random.choice(len(real), max_samples, replace=False)]
+    if len(synth) > max_samples:
+        synth = synth[np.random.choice(len(synth), max_samples, replace=False)]
+
+    combined = np.vstack([real, synth])
+    n_real = len(real)
+
+    full_matrix = dtw.distance_matrix_fast(combined, window=window, parallel=True)
+    cross_block = full_matrix[:n_real, n_real:]  # real rows x synthetic columns
+
+    return {
+        "mean": float(np.mean(cross_block)),
+        "median": float(np.median(cross_block)),
+        "std": float(np.std(cross_block)),
+        "n_pairs": cross_block.size,
+    }
 
 
 class WGANMonitor(tf.keras.callbacks.Callback):
@@ -172,6 +193,52 @@ class ECGSampleSaver(tf.keras.callbacks.Callback):
             plt.savefig(f"{self.output_dir}/epoch_{epoch+1}.png")
             plt.close()
 
+
+class DTWDiversityCallback(tf.keras.callbacks.Callback):
+    """
+    Every `every_n_epochs`, generates synthetic samples from the current
+    generator and computes real-real, synth-synth, and real-synth DTW
+    distance statistics, logging them to MLflow.
+    """
+
+    def __init__(self, real_signals: np.ndarray, latent_dim: int, every_n_epochs: int = 10,
+                 n_generate: int = 100, max_samples: int = 100, window: int | None = 20):
+        super().__init__()
+        self.real_signals = real_signals
+        self.latent_dim = latent_dim
+        self.every_n_epochs = every_n_epochs
+        self.n_generate = n_generate
+        self.max_samples = max_samples
+        self.window = window
+
+    def on_epoch_end(self, epoch, logs=None):
+        if (epoch + 1) % self.every_n_epochs != 0:
+            return
+
+        z = tf.random.normal(shape=(self.n_generate, self.latent_dim))
+        synthetic = self.model.generator(z, training=False).numpy()
+
+        real_stats = dtw_within_set(self.real_signals, max_samples=self.max_samples, window=self.window)
+        synth_stats = dtw_within_set(synthetic, max_samples=self.max_samples, window=self.window)
+        cross_stats = dtw_cross_set(self.real_signals, synthetic, max_samples=self.max_samples, window=self.window)
+
+        diversity_ratio = synth_stats["mean"] / (real_stats["mean"] + 1e-8)
+
+        metrics = {
+            "dtw_real_real_mean": real_stats["mean"],
+            "dtw_synth_synth_mean": synth_stats["mean"],
+            "dtw_real_synth_mean": cross_stats["mean"],
+            "dtw_diversity_ratio": diversity_ratio,
+        }
+        mlflow.log_metrics(metrics, step=epoch)
+
+        print(
+            f"[Epoch {epoch + 1}] real-real={real_stats['mean']:.2f} "
+            f"synth-synth={synth_stats['mean']:.2f} real-synth={cross_stats['mean']:.2f} "
+            f"diversity_ratio={diversity_ratio:.3f}"
+        )
+
+
 def plot_wgan_losses(history, target_class):
     """Plot generator and critic loss."""
     d_loss = history.history['d_loss']
@@ -205,19 +272,6 @@ def evaluate_distribution_pca(real_signals, fake_signals):
     plt.savefig("outputs/pca_evaluation.png")
     plt.close()
 
-def calculate_mean_dtw(real_signals, fake_signals, n_samples=100):
-    """
-    Computing mean DTW distance between random pairs of real and generated signals.
-    """
-    distances = []
-    for i in range(n_samples):
-
-        idx_real = np.random.randint(0, real_signals.shape[0])
-        idx_fake = np.random.randint(0, fake_signals.shape[0])
-        d = dtw(real_signals[idx_real, :, 0], fake_signals[idx_fake, :, 0])
-        distances.append(d)
-        
-    return np.mean(distances)  
 
 def load_all_multiclass_data(data_dir: str, num_records: int, random_seed: int):
     # Load data with IQR downsampling.
@@ -304,9 +358,7 @@ joblib.dump(scaler, f'outputs/wgan_scaler_class_{args.target_class}.pkl')
 
 # Reshape for conv layers
 X_dataset_w = X_minority_scaled.reshape(-1, window_size, 1).astype(np.float32)
-#baseline_metrics = calculate_real_dtw_baseline(X_dataset_w)
-#print(baseline_metrics)
-# Build models
+
 print("Building Generator and Critic...")
 generator = build_generator(window_size=window_size, latent_dim=args.latent_dim)
 critic = build_critic(input_shape=(window_size, 1))
@@ -315,7 +367,7 @@ wgan = WGANGP(
     generator=generator, 
     critic=critic, 
     latent_dim=args.latent_dim,
-    d_steps=5,
+    d_steps=3,
     gp_weight=10.0
 )
 
@@ -335,7 +387,8 @@ callbacks = [
     WGANMonitor(num_samples=4, latent_dim=args.latent_dim, save_dir='outputs/wgan_samples', class_name=args.target_class, real_samples=X_dataset_w),
     MLflowWGANCallback(),
     ECGSampleSaver(latent_dim=args.latent_dim, output_dir='outputs/wgan_samples', interval=50),
-    EpochWeightsSaver(filepath="checkpoints/weights/wgan_epoch_{epoch:03d}.weights.h5", interval=50)
+    EpochWeightsSaver(filepath="checkpoints/weights/wgan_epoch_{epoch:03d}.weights.h5", interval=50),
+    DTWDiversityCallback(real_signals=X_dataset_w, latent_dim=args.latent_dim, every_n_epochs=10),
 ]
 
 print(f"\n{'='*50}")
@@ -358,14 +411,6 @@ print("Computing evaluation metrics for generated samples...")
 
 # PCA evaluation
 evaluate_distribution_pca(X_dataset_w, X_synthetic)
-
-# DTW evaluation
-mean_dtw = calculate_mean_dtw(X_dataset_w, X_synthetic, n_samples=100)
-
-# Register metrics in MLflow
-mlflow.log_metric("final_mean_dtw", mean_dtw)
-
-print(f"Final mean DTW: {mean_dtw:.4f}")
 
 # Save outputs
 plot_wgan_losses(history, args.target_class)
