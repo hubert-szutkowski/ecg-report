@@ -48,27 +48,24 @@ def build_generator(window_size=216, latent_dim=100):
     output = layers.Conv1D(1, kernel_size=3, padding="same", activation="linear")(x)
     return Model(z, output, name="dynamic_slim_generator")
 
+
 def build_critic(input_shape=(216, 1)):
     inp = layers.Input(shape=input_shape)
 
-    # 216 -> 108
     x = layers.Conv1D(32, kernel_size=7, strides=2, padding="same")(inp)
     x = layers.LeakyReLU(0.2)(x)
 
-    # 108 -> 54
     x = layers.Conv1D(64, kernel_size=5, strides=2, padding="same")(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
-    # 54 -> 27
     x = layers.Conv1D(128, kernel_size=3, strides=2, padding="same")(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
-    #x = MinibatchStdDev()(x)
     x = layers.Flatten()(x)
     x = layers.Dropout(0.3)(x)
-    
+
     out = layers.Dense(1, activation="linear")(x)
     return Model(inp, out, name="slim_critic")
 
@@ -134,9 +131,9 @@ class WGANGP(Model):
         with tf.GradientTape() as tape:
             fake_samples = self.generator(random_latent_vectors, training=True)
             gen_logits = self.critic(fake_samples, training=True)
-            
+
             g_loss = -tf.reduce_mean(gen_logits)
-            
+
         gen_gradient = tape.gradient(g_loss, self.generator.trainable_variables)
         self.g_optimizer.apply_gradients(zip(gen_gradient, self.generator.trainable_variables))
 
