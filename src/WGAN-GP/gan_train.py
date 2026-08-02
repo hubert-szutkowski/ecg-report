@@ -36,7 +36,7 @@ parser.add_argument("--aami-class", type=str, required=True, help="AAMI class la
 parser.add_argument("--fold", type=int, required=True, help=f"Fold index (0-{N_FOLD_SPLITS - 1}) from StratifiedGroupKFold to train on")
 parser.add_argument("--selected-samples", type=int, default=20, help="Number of ECG records to load")
 parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs (GANs need more!)")
-parser.add_argument("--d-steps", type=int, default=5, help="Number of critic updates per generator update")
+parser.add_argument("--d-steps", type=int, default=3, help="Number of critic updates per generator update")
 parser.add_argument("--gp-weight", type=float, default=10.0, help="Gradient penalty weight")
 parser.add_argument("--latent-dim", type=int, default=32, help="Dimension of the latent noise vector")
 parser.add_argument("--batch-size", type=int, default=32, help="Batch size for training")
