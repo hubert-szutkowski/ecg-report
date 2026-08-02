@@ -142,9 +142,9 @@ Because the dataset already contains clean ECG recordings, no advanced signal de
 
 ## AI-Assisted Development
 
-* Gemini Code Assist
+* Gemini Code Assist and Claude Code
 
-Gemini Code Assist was used as a productivity tool during development for code generation, refactoring support, documentation assistance, and development acceleration. All architectural decisions, model design choices, experimentation, and implementation remained under developer supervision.
+Gemini Code Assist and Claude Code was used as a productivity tool during development for code generation, refactoring support, documentation assistance, and development acceleration. All architectural decisions, model design choices, experimentation, and implementation remained under developer supervision.
 
 ---
 
