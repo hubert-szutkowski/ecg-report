@@ -1,5 +1,6 @@
 import os
 import csv
+import json
 import argparse
 import shutil
 import sys
@@ -297,6 +298,7 @@ def augment_fold_with_gan(X_train_raw, y_train_raw, groups_train, encoder, windo
         )
         synthetic_X_parts.append(X_synthetic.reshape(-1, window_size))
         synthetic_y_parts.append(np.full(len(X_synthetic), class_idx, dtype=y_train_raw.dtype))
+        np.save(f"outputs/gan_synthetic_{class_name}_fold_{fold_number}.npy", X_synthetic)
         augmentation_report.append({
             "class": class_name,
             "count_before": count_before,
@@ -453,6 +455,9 @@ def train_binary_stage(args):
     with open("outputs/metrics_binary.csv", "w", newline="") as f:
         csv.writer(f).writerow(["Fold", "Best Epoch", "Train Acc", "Val Acc", "Train Loss", "Val Loss", "Val AUC", "F1 Score"])
 
+    fold_splits_path = "outputs/fold_splits_binary.json"
+    fold_splits = {"window_size": window_size, "folds": []}
+
     sgkf = StratifiedGroupKFold(n_splits=args.Folds, shuffle=True, random_state=args.random_seed)
     fold_number = 0
 
@@ -463,6 +468,8 @@ def train_binary_stage(args):
         X_test_raw = X_data[test_idx]
         y_train_raw = y_encoded[train_idx]
         y_test_raw = y_encoded[test_idx]
+        groups_train = groups[train_idx]
+        groups_val = groups[test_idx]
 
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train_raw)
@@ -590,6 +597,14 @@ def train_binary_stage(args):
                 best_f1_score,
             ])
 
+        fold_splits["folds"].append({
+            "fold": fold_number,
+            "train_record_ids": sorted(set(groups_train.tolist())),
+            "val_record_ids": sorted(set(groups_val.tolist())),
+        })
+        with open(fold_splits_path, "w", encoding="utf-8") as handle:
+            json.dump(fold_splits, handle, indent=2)
+
         plot_loss(history, fold_number, stage="binary")
         fold_number += 1
 
@@ -646,6 +661,9 @@ def train_multiclass_stage(args):
     report_path = "outputs/fold_report_multiclass.txt"
     if os.path.exists(report_path):
         os.remove(report_path)
+
+    fold_splits_path = "outputs/fold_splits_multiclass.json"
+    fold_splits = {"window_size": window_size, "folds": []}
 
     def _class_counts(y_arr):
         return {name: int(np.sum(y_arr == idx)) for idx, name in enumerate(encoder.classes_)}
@@ -829,6 +847,14 @@ def train_multiclass_stage(args):
                 "f1_score": best_f1_score,
             },
         )
+
+        fold_splits["folds"].append({
+            "fold": fold_number,
+            "train_record_ids": sorted(set(groups_train.tolist())),
+            "val_record_ids": sorted(set(groups_val.tolist())),
+        })
+        with open(fold_splits_path, "w", encoding="utf-8") as handle:
+            json.dump(fold_splits, handle, indent=2)
 
         plot_loss(history, fold_number, stage="multiclass")
         fold_number += 1
