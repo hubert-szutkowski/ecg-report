@@ -1,96 +1,66 @@
 import argparse
-import mlflow
+import json
+import sys
+import tempfile
+from pathlib import Path
+
 from azure.ai.ml import MLClient
 from azure.ai.ml.entities import Model
 from azure.ai.ml.constants import AssetTypes
-from azure.identity import DefaultAzureCredential
-import sys
+from azure.identity import InteractiveBrowserCredential
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Register a new Champion model based on the evaluation job's promotion decision")
+    parser.add_argument("--eval-job-name", type=str, required=True, help="Azure ML evaluation job name whose promotion_decision.json to read")
+    parser.add_argument("--train-job-name", type=str, required=True, help="Azure ML training job name to register as the new Champion, if promoted")
+    parser.add_argument("--model-name", type=str, default="ecg_multiclass_model", help="Registered model name")
+    return parser
+
+
+def load_promotion_decision(ml_client: MLClient, eval_job_name: str) -> dict:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        ml_client.jobs.download(name=eval_job_name, download_path=tmp_dir)
+        try:
+            decision_path = next(Path(tmp_dir).rglob("promotion_decision.json"))
+        except StopIteration:
+            raise RuntimeError(f"promotion_decision.json not found in outputs of job '{eval_job_name}'")
+        return json.loads(decision_path.read_text())
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate Challenger model against the registered Champion")
-    parser.add_argument("--experiment-name", type=str, default="ecg-anomaly-difference", help="Azure ML experiment name")
-    parser.add_argument("--model-name", type=str, default="ecg_multiclass_model", help="Registered model name")
-    parser.add_argument("--metric-name", type=str, default="cv_mean_val_auc", help="The exact name of the manually logged metric to compare")
-    parser.add_argument("--direction", type=str, choices=["maximize", "minimize"], default="maximize", help="Whether to maximize (e.g., AUC) or minimize (e.g., loss) the metric")
-    args = parser.parse_args()
+    args = build_parser().parse_args()
 
-    # Init Azure ML and MLflow
-    ml_client = MLClient.from_config(credential=DefaultAzureCredential())
-    workspace = ml_client.workspaces.get(name=ml_client.workspace_name)
-    mlflow.set_tracking_uri(workspace.mlflow_tracking_uri)
+    print("Logging to Azure...")
+    ml_client = MLClient.from_config(credential=InteractiveBrowserCredential())
 
-    # Load latest challenger run
-    experiment = mlflow.get_experiment_by_name(args.experiment_name)
-    if not experiment:
-        print(f"CRITICAL: Experiment '{args.experiment_name}' not found.")
-        return
+    decision = load_promotion_decision(ml_client, args.eval_job_name)
+    print(decision["reason"])
 
-    runs = mlflow.search_runs(
-        experiment_ids=[experiment.experiment_id],
-        order_by=["attributes.start_time DESC"],
-        max_results=1
+    if not decision["promote"]:
+        print("REJECTED: challenger did not beat the champion.")
+        sys.exit(1)
+
+    print("SUCCESS: promoting challenger to Champion...")
+
+    model_uri = f"azureml://jobs/{args.train_job_name}/outputs/artifacts/paths/outputs/ecg_multiclass_model.keras"
+
+    new_champion = Model(
+        path=model_uri,
+        name=args.model_name,
+        description="InceptionTime ECG Multiclass Classifier",
+        type=AssetTypes.CUSTOM_MODEL,
+        tags={
+            **{k: str(v) for k, v in decision["challenger_metrics"].items()},
+            "run_id": args.train_job_name,
+            "framework": "keras_tensorflow",
+        },
     )
 
-    if runs.empty:
-        print("CRITICAL: No runs found for this experiment.")
-        return
+    ml_client.models.create_or_update(new_champion)
+    print(f"SUCCESS: Registered new Champion model version for run {args.train_job_name}")
+    sys.exit(0)
 
-    latest_run = runs.iloc[0]
-    challenger_run_id = latest_run.run_id
-    
-    # Read the target metric
-    metric_column_name = f"metrics.{args.metric_name}"
-    
-    if metric_column_name not in latest_run:
-        print(f"CRITICAL: Metric '{args.metric_name}' was not found in the latest run. Please check your training script.")
-        return
-        
-    challenger_score = float(latest_run[metric_column_name])
-    print(f"Challenger Run ID: {challenger_run_id}")
-    print(f"Challenger score ({args.metric_name}): {challenger_score:.4f}")
-
-    # Load current champion score
-    best_registered_score = -float('inf') if args.direction == "maximize" else float('inf')
-    
-    try:
-        champion_model = ml_client.models.get(name=args.model_name, label="latest")
-        best_registered_score = float(champion_model.tags.get(args.metric_name, best_registered_score))
-        print(f"Current Champion model version: {champion_model.version}")
-        print(f"Current Champion score ({args.metric_name}): {best_registered_score:.4f}")
-    except Exception:
-        print("INFO: No registered Champion model found. This will be the first deployment.")
-
-    # Compare challenger vs champion
-    is_better = False
-    if args.direction == "maximize":
-        is_better = challenger_score > best_registered_score
-    else:
-        is_better = challenger_score < best_registered_score
-
-    if is_better:
-        print(f"SUCCESS: Challenger outperformed the Champion ({challenger_score:.4f} vs {best_registered_score:.4f})!")
-        print("Proceeding with model registration...")
-        
-        model_uri = f"azureml://jobs/{challenger_run_id}/outputs/artifacts/paths/outputs/ecg_multiclass_model.keras"
-        
-        new_champion = Model(
-            path=model_uri,
-            name=args.model_name,
-            description="InceptionTime ECG Multiclass Classifier",
-            type=AssetTypes.CUSTOM_MODEL,
-            tags={
-                args.metric_name: str(challenger_score),
-                "run_id": challenger_run_id,
-                "framework": "keras_tensorflow"
-            }
-        )
-        
-        ml_client.models.create_or_update(new_champion)
-        print(f"SUCCESS: Registered new Champion version with {args.metric_name}: {challenger_score:.4f}")
-        sys.exit(0)  # Success
-    else:
-        print(f"REJECTED: Challenger score ({challenger_score:.4f}) did not beat Champion score ({best_registered_score:.4f}).")
-        sys.exit(1)  # Failure
 
 if __name__ == "__main__":
     main()
