@@ -20,3 +20,4 @@ dependencies:
     - tslearn
     - fastdtw
     - dtaidistance
+    - scipy
