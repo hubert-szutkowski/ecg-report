@@ -28,7 +28,8 @@ if MULTISTAGE_DIR not in sys.path:
 
 import cascade
 from pan_tompkins import pan_tompkins_detect
-from multistage_preprocessing import get_record_ids, load_data, SYMBOL_TO_CLASS
+from multistage_preprocessing import get_record_ids, SYMBOL_TO_CLASS
+from multistage_train import load_data
 from multistage_model import PositionalEmbedding
 
 CLINICAL_CLASS_ORDER = ["N", "S", "V", "F", "Q"]
@@ -63,6 +64,12 @@ def load_training_run_params(train_job_name: str) -> dict:
 
 def load_fold_splits(train_outputs_dir: str, stage: str) -> dict:
     path = os.path.join(train_outputs_dir, f"fold_splits_{stage}.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} not found. The training job's outputs don't include fold_splits_{stage}.json - "
+            "it was likely run with an older multistage_train.py that predates fold-split persistence. "
+            "Re-run Azure/submit_job.py to produce a training job with current code, then evaluate that one."
+        )
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
 
