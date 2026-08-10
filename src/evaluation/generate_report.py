@@ -933,17 +933,20 @@ def main():
     with open(os.path.join(output_dir, "promotion_decision.json"), "w", encoding="utf-8") as handle:
         json.dump(promotion_decision, handle, indent=2)
 
-    for key, value in challenger_metrics.items():
-        if isinstance(value, (int, float)) and value is not None:
-            mlflow.log_metric(key, value)
-    mlflow.log_metric("cpu_batching_speedup_x", cpu_benchmarks["batching_speedup_x"])
-    mlflow.log_metric("pan_tompkins_aggregate_sensitivity", pan_tompkins_aggregate["sensitivity"])
-    mlflow.log_metric("pan_tompkins_aggregate_ppv", pan_tompkins_aggregate["ppv"])
-    mlflow.log_artifact(os.path.join(output_dir, "evaluation_report.md"))
-    mlflow.log_artifact(os.path.join(output_dir, "metrics.json"))
-    mlflow.log_artifact(os.path.join(output_dir, "promotion_decision.json"))
-    for fig_path in glob.glob(os.path.join(img_dir, "*.png")):
-        mlflow.log_artifact(fig_path)
+    try:
+        for key, value in challenger_metrics.items():
+            if isinstance(value, (int, float)) and value is not None:
+                mlflow.log_metric(key, value)
+        mlflow.log_metric("cpu_batching_speedup_x", cpu_benchmarks["batching_speedup_x"])
+        mlflow.log_metric("pan_tompkins_aggregate_sensitivity", pan_tompkins_aggregate["sensitivity"])
+        mlflow.log_metric("pan_tompkins_aggregate_ppv", pan_tompkins_aggregate["ppv"])
+        mlflow.log_artifact(os.path.join(output_dir, "evaluation_report.md"))
+        mlflow.log_artifact(os.path.join(output_dir, "metrics.json"))
+        mlflow.log_artifact(os.path.join(output_dir, "promotion_decision.json"))
+        for fig_path in glob.glob(os.path.join(img_dir, "*.png")):
+            mlflow.log_artifact(fig_path)
+    except Exception as exc:
+        print(f"Warning: mlflow logging failed ({exc}) - report/metrics/figures are still saved under {output_dir}/")
 
     print(f"Promotion decision: {promotion_decision['reason']}")
 
