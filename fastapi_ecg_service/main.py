@@ -12,7 +12,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from src.AAMI_classification_multistages.multistage_model import PositionalEmbedding
-from .pan_tompkins import pan_tompkins_detect
+from src.cascade import run_cascade_batch as run_cascade_core
 
 WEIGHTS_DIR = Path("/app/weights")
 BINARY_PATH = WEIGHTS_DIR / "ecg_binary_model.keras"
@@ -20,7 +20,6 @@ MULTICLASS_PATH = WEIGHTS_DIR / "ecg_multiclass_model.keras"
 SCALER_PATH = WEIGHTS_DIR / "scaler.pkl"
 
 WINDOW_SIZE = 216
-HALF_WINDOW = WINDOW_SIZE // 2
 BINARY_THRESHOLD = 0.5
 
 CUSTOM_OBJECTS = {"PositionalEmbedding": PositionalEmbedding}
@@ -70,89 +69,40 @@ def load_models() -> None:
     logger.info("Startup complete.")
 
 
-# --- Windowing (must match training exactly) ---
-
-def extract_windows_around_peaks(signal: np.ndarray, peak_indices: np.ndarray, window_size: int = WINDOW_SIZE):
-    half_window = window_size // 2
-    n_samples = len(signal)
-    windows = []
-    valid_peaks = []
-    for peak in peak_indices:
-        start = int(peak) - half_window
-        end = start + window_size
-        if start >= 0 and end <= n_samples:
-            windows.append(signal[start:end])
-            valid_peaks.append(int(peak))
-    if not windows:
-        return np.empty((0, window_size), dtype=np.float32), np.empty((0,), dtype=int)
-    return np.stack(windows).astype(np.float32), np.array(valid_peaks)
-
-
-def normalize_windows(windows_raw: np.ndarray) -> np.ndarray:
-    return scaler.transform(windows_raw).astype(np.float32)
-
+# --- Cascade (windowing/detection/inference logic lives in src/cascade.py) ---
 
 def run_cascade_batch(signal: np.ndarray, fs: float) -> "BeatStreamResponse":
     if not np.all(np.isfinite(signal)):
         raise HTTPException(status_code=400, detail="Signal contains NaN or infinite values.")
 
-    peak_indices = pan_tompkins_detect(signal, fs)
-    logger.info("Pan-Tompkins detected %d candidate peaks", len(peak_indices))
-
-    windows_raw, valid_peaks = extract_windows_around_peaks(signal, peak_indices)
-    if len(valid_peaks) == 0:
-        raise HTTPException(status_code=400, detail="No valid beats found (peaks too close to signal boundaries).")
-
     try:
-        windows_normalized = normalize_windows(windows_raw)
-    except Exception as exc:
-        logger.exception("Scaler normalization failed")
-        raise HTTPException(status_code=500, detail="Internal error during signal normalization.") from exc
-
-    x_all = windows_normalized.reshape(-1, WINDOW_SIZE, 1)
-
-    try:
-        binary_probs = binary_model.predict(x_all, batch_size=256, verbose=0).flatten()
-    except Exception as exc:
-        logger.exception("Batched binary inference failed")
-        raise HTTPException(status_code=500, detail="Internal error during binary prediction.") from exc
-
-    is_anomaly_mask = binary_probs >= BINARY_THRESHOLD
-
-    multiclass_probs_by_index: dict[int, list[float]] = {}
-    predicted_class_by_index: dict[int, int] = {}
-
-    if multiclass_model is not None and is_anomaly_mask.any():
-        anomaly_indices = np.where(is_anomaly_mask)[0]
-        try:
-            class_probs_batch = multiclass_model.predict(x_all[anomaly_indices], batch_size=256, verbose=0)
-        except Exception as exc:
-            logger.exception("Batched multiclass inference failed")
-            raise HTTPException(status_code=500, detail="Internal error during multiclass prediction.") from exc
-
-        for i, idx in enumerate(anomaly_indices):
-            multiclass_probs_by_index[int(idx)] = class_probs_batch[i].tolist()
-            predicted_class_by_index[int(idx)] = int(np.argmax(class_probs_batch[i]))
-
-    results: list[BeatResult] = []
-    for i, peak in enumerate(valid_peaks):
-        results.append(
-            BeatResult(
-                beat_index=i,
-                peak_sample=int(peak),
-                binary_anomaly_probability=float(binary_probs[i]),
-                is_anomaly=bool(is_anomaly_mask[i]),
-                multiclass_probabilities=multiclass_probs_by_index.get(i),
-                predicted_class=predicted_class_by_index.get(i),
-            )
+        cascade_result = run_cascade_core(
+            signal,
+            fs,
+            binary_model=binary_model,
+            scaler=scaler,
+            multiclass_model=multiclass_model,
+            window_size=WINDOW_SIZE,
+            binary_threshold=BINARY_THRESHOLD,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        logger.exception("Cascade inference failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    logger.info("Cascade complete: %d beats, %d anomalies", len(results), int(is_anomaly_mask.sum()))
+    results = [BeatResult(**beat) for beat in cascade_result["results"]]
+    n_anomalies = sum(1 for beat in cascade_result["results"] if beat["is_anomaly"])
+    logger.info(
+        "Pan-Tompkins detected %d candidate peaks", cascade_result["detected_peaks"]
+    )
+    logger.info("Cascade complete: %d beats, %d anomalies", len(results), n_anomalies)
+
     return BeatStreamResponse(
-        total_beats=len(results),
-        detected_peaks=len(peak_indices),
-        window_size=WINDOW_SIZE,
-        fs=fs,
+        total_beats=cascade_result["total_beats"],
+        detected_peaks=cascade_result["detected_peaks"],
+        window_size=cascade_result["window_size"],
+        fs=cascade_result["fs"],
         results=results,
     )
 

@@ -1,0 +1,54 @@
+# Documentation only - not loaded by any script. The evaluation job is defined
+# inline in Python by Azure/submit_evaluate_job.py (the same pattern submit_job.py
+# uses), because that inline-command() approach is what the repo's Azure ML jobs
+# actually run on; this file exists so the job's contract is visible in git even
+# though Azure/submit_evaluate_job.py itself is gitignored (matches submit_job.py).
+$schema: https://azuremlschemas.azureedge.net/latest/commandComponent.schema.json
+name: ecg_evaluation_component
+display_name: Evaluate ECG Cascade (Binary + Multiclass)
+version: 1.0.0
+type: command
+
+inputs:
+  data_dir:
+    type: uri_folder
+    description: "Path to the registered MIT-BIH data asset"
+  train_outputs:
+    type: uri_folder
+    description: "azureml://jobs/<train_job_name>/outputs/artifacts/paths/outputs/ of the training run to evaluate"
+  train_outputs_nogan:
+    type: uri_folder
+    optional: true
+    description: "Same, for an optional --skip-gan-augmentation baseline run (section 1.6)"
+  fold:
+    type: integer
+    optional: true
+    description: "Restrict per-fold sections (1.1-1.5, 1.7) to a single fold"
+  records:
+    type: string
+    optional: true
+    description: "Comma-separated record ids for the Pan-Tompkins/CPU benchmark sections (default: first 10)"
+
+code: ./src
+
+environment:
+  name: ecg-training-env
+  image: mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu20.04:latest
+  conda_file: ./conda.yml
+
+compute: cpu-cluster  # Standard_DS3_v2, same cluster train jobs use - see Azure/submit_job.py
+
+command: >-
+  python evaluation/generate_report.py
+  --data-dir ${{inputs.data_dir}}
+  --train-job-name <train_job_name>
+  --train-outputs-dir ${{inputs.train_outputs}}
+
+outputs:
+  - evaluation_report.md
+  - metrics.json
+  - promotion_decision.json
+  - docs/img/confusion_matrix.png
+  - docs/img/per_fold_metrics.png
+  - docs/img/pan_tompkins_detection.png
+  - docs/img/wgan_real_vs_synthetic.png

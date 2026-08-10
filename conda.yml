@@ -17,5 +17,9 @@ dependencies:
     - mlflow
     - azureml-mlflow
     - azureml-core
+    - azure-ai-ml
+    - azure-identity
     - tslearn
     - fastdtw
+    - dtaidistance
+    - scipy

@@ -2,7 +2,7 @@ import numpy as np
 from scipy.signal import butter, filtfilt, find_peaks
 
 
-def pan_tompkins_detect(signal: np.ndarray, fs: float) -> np.ndarray:
+def pan_tompkins_detect(signal: np.ndarray, fs: float, return_intermediate: bool = False):
     nyq = fs / 2.0
     low, high = 5 / nyq, 15 / nyq
     b, a = butter(1, [low, high], btype="band")
@@ -26,4 +26,7 @@ def pan_tompkins_detect(signal: np.ndarray, fs: float) -> np.ndarray:
         local_max = start + int(np.argmax(signal[start:end]))
         refined_peaks.append(local_max)
 
-    return np.unique(np.array(refined_peaks, dtype=int))
+    peaks = np.unique(np.array(refined_peaks, dtype=int))
+    if not return_intermediate:
+        return peaks
+    return peaks, {"filtered": filtered, "integrated": integrated, "threshold": threshold}

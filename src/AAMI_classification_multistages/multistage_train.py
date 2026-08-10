@@ -1,7 +1,9 @@
 import os
 import csv
+import json
 import argparse
 import shutil
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -21,6 +23,13 @@ from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, roc_auc_sc
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 from tensorflow.keras.utils import to_categorical
 import mlflow.keras
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+GAN_DIR = os.path.join(os.path.dirname(CURRENT_DIR), "WGAN-GP")
+if GAN_DIR not in sys.path:
+    sys.path.insert(0, GAN_DIR)
+
+from gan_train import train_gan_and_generate
 
 
 class MLflowFoldCallback(tf.keras.callbacks.Callback):
@@ -51,6 +60,14 @@ def build_parser():
         choices=["binary", "multiclass", "both"],
         help="Which training pipeline to run",
     )
+    parser.add_argument("--skip-gan-augmentation", action="store_true", help="Disable WGAN-GP minority class augmentation in the multiclass stage")
+    parser.add_argument("--gan-epochs", type=int, default=500, help="Epochs per per-class WGAN-GP training run")
+    parser.add_argument("--gan-d-steps", type=int, default=3, help="Critic updates per generator update in WGAN-GP")
+    parser.add_argument("--gan-gp-weight", type=float, default=10.0, help="Gradient penalty weight for WGAN-GP")
+    parser.add_argument("--gan-latent-dim", type=int, default=32, help="Latent noise dimension for WGAN-GP")
+    parser.add_argument("--gan-batch-size", type=int, default=32, help="Batch size for WGAN-GP training")
+    parser.add_argument("--gan-critic-lr-multiplier", type=float, default=3.0, help="Critic LR as a multiple of --gan-start-learning-rate")
+    parser.add_argument("--gan-start-learning-rate", type=float, default=5e-5, help="Generator learning rate for WGAN-GP")
     return parser
 
 
@@ -176,6 +193,248 @@ def load_data(data_dir: str, num_records: int, random_seed: int, stage: str):
     return X_master[valid_indices], y_master[valid_indices], groups_master[valid_indices], window_size
 
 
+def compute_gan_augmentation_plan(y_train_raw: np.ndarray, encoder: LabelEncoder, exclude_classes=("N", "Q"), max_growth_multiplier: float = 1.05) -> dict:
+    """
+    Determines how many synthetic samples per class are needed to slightly
+    top up the minority AAMI classes (excluding N and Q) within one training fold.
+
+    Every eligible class (typically S, F, sometimes V) present in the fold is
+    topped up towards the size of the largest eligible class in that fold,
+    but capped at max_growth_multiplier times its own current count - a full
+    equalization was generating thousands of synthetic windows per class,
+    which is far more than intended; this keeps the boost modest.
+    Classes absent from the fold, or already excluded, are skipped.
+
+    Parameters:
+        - y_train_raw: np.ndarray of encoded labels for the training partition of a fold
+        - encoder: LabelEncoder used to map encoded labels back to AAMI class names
+        - exclude_classes: class names never targeted for GAN augmentation
+        - max_growth_multiplier: hard cap on a class's growth relative to its own count (e.g. 1.05 = +5%)
+    Returns:
+        - dict of {class_name: n_samples_to_generate}, only classes needing augmentation
+    """
+    class_counts = {}
+    for class_idx, class_name in enumerate(encoder.classes_):
+        if class_name in exclude_classes:
+            continue
+        count = int(np.sum(y_train_raw == class_idx))
+        if count > 0:
+            class_counts[class_name] = count
+
+    if not class_counts:
+        return {}
+
+    target_count = max(class_counts.values())
+
+    plan = {}
+    for class_name, count in class_counts.items():
+        if count >= target_count:
+            continue
+        deficit = target_count - count
+        max_growth = int(count * (max_growth_multiplier - 1))
+        n_to_generate = min(deficit, max_growth)
+        if n_to_generate > 0:
+            plan[class_name] = n_to_generate
+
+    return plan
+
+
+def augment_fold_with_gan(X_train_raw, y_train_raw, groups_train, encoder, window_size, fold_number, args):
+    """
+    Tops up minority AAMI classes (per compute_gan_augmentation_plan) with
+    WGAN-GP synthetic windows, using ONLY this fold's training patients.
+
+    groups_train must be sliced with the same train_idx as X_train_raw /
+    y_train_raw so that each per-class GAN only ever sees patients from the
+    training partition of this fold - validation patients, and therefore
+    their morphology, never reach the GAN.
+
+    Parameters:
+        - X_train_raw, y_train_raw: raw (unscaled) training windows/labels for this fold
+        - groups_train: patient/record id per row, aligned with X_train_raw
+        - encoder: LabelEncoder mapping class names <-> encoded labels
+        - window_size: ECG window length
+        - fold_number: current CV fold, used for output naming
+        - args: parsed CLI args, provides GAN hyperparameters and --random-seed
+    Returns:
+        - X_train_raw, y_train_raw: with synthetic windows appended for topped-up classes
+        - augmentation_report: list of per-class dicts (class, count_before, n_patients_used,
+          n_generated, count_after), empty if no class needed augmentation
+    """
+    plan = compute_gan_augmentation_plan(y_train_raw, encoder)
+    if not plan:
+        return X_train_raw, y_train_raw, []
+
+    print(f"Fold {fold_number}: GAN augmentation plan: {plan}")
+
+    synthetic_X_parts, synthetic_y_parts = [], []
+    augmentation_report = []
+    class_name_to_idx = {name: idx for idx, name in enumerate(encoder.classes_)}
+
+    for class_name, n_to_generate in plan.items():
+        if n_to_generate <= 0:
+            continue
+
+        class_idx = class_name_to_idx[class_name]
+        class_mask = y_train_raw == class_idx
+        count_before = int(class_mask.sum())
+        n_patients_used = len(np.unique(groups_train[class_mask]))
+
+        X_synthetic = train_gan_and_generate(
+            X_real_class=X_train_raw[class_mask],
+            groups_real_class=groups_train[class_mask],
+            n_samples_to_generate=n_to_generate,
+            window_size=window_size,
+            target_class_name=class_name,
+            fold=fold_number,
+            epochs=args.gan_epochs,
+            d_steps=args.gan_d_steps,
+            gp_weight=args.gan_gp_weight,
+            latent_dim=args.gan_latent_dim,
+            batch_size=args.gan_batch_size,
+            critic_lr_multiplier=args.gan_critic_lr_multiplier,
+            start_learning_rate=args.gan_start_learning_rate,
+            random_seed=args.random_seed,
+        )
+        synthetic_X_parts.append(X_synthetic.reshape(-1, window_size))
+        synthetic_y_parts.append(np.full(len(X_synthetic), class_idx, dtype=y_train_raw.dtype))
+        np.save(f"outputs/gan_synthetic_{class_name}_fold_{fold_number}.npy", X_synthetic)
+        augmentation_report.append({
+            "class": class_name,
+            "count_before": count_before,
+            "n_patients_used": n_patients_used,
+            "n_generated": len(X_synthetic),
+            "count_after": count_before + len(X_synthetic),
+        })
+
+    if not synthetic_X_parts:
+        return X_train_raw, y_train_raw, augmentation_report
+
+    X_train_raw = np.concatenate([X_train_raw] + synthetic_X_parts, axis=0)
+    y_train_raw = np.concatenate([y_train_raw] + synthetic_y_parts, axis=0)
+    print(f"Fold {fold_number}: added {sum(len(p) for p in synthetic_X_parts)} synthetic windows -> train size {len(X_train_raw)}")
+
+    return X_train_raw, y_train_raw, augmentation_report
+
+
+def write_fold_report(
+    report_path,
+    fold_number,
+    window_size,
+    train_counts_before,
+    train_counts_after,
+    val_counts,
+    n_train_patients,
+    n_val_patients,
+    n_overlapping_patients,
+    augmentation_report,
+    fold_metrics,
+):
+    """
+    Appends a full, human-readable report block for one CV fold to a .txt file,
+    so the whole multiclass run can be audited fold-by-fold without digging
+    through mlflow or the raw CSVs.
+
+    Parameters:
+        - report_path: path to the .txt file (appended to, created if missing)
+        - fold_number: current CV fold
+        - window_size: ECG window length
+        - train_counts_before / train_counts_after: {class_name: count} dicts, pre/post GAN augmentation
+        - val_counts: {class_name: count} dict for the untouched validation partition
+        - n_train_patients / n_val_patients: unique patient counts per partition
+        - n_overlapping_patients: patients present in both train and val groups (sanity check, should be 0)
+        - augmentation_report: list of per-class dicts from augment_fold_with_gan
+        - fold_metrics: dict with best_epoch, train_acc, val_acc, train_loss, val_loss, val_auc, f1_score
+    """
+    def _fmt_counts(counts):
+        return "\n".join(f"    {name:>3}: {count:5d}" for name, count in sorted(counts.items()))
+
+    total_before = sum(train_counts_before.values())
+    total_after = sum(train_counts_after.values())
+
+    nonzero_before = [c for c in train_counts_before.values() if c > 0]
+    imbalance_before = (max(nonzero_before) / min(nonzero_before)) if len(nonzero_before) > 1 else float("nan")
+    nonzero_after = [c for c in train_counts_after.values() if c > 0]
+    imbalance_after = (max(nonzero_after) / min(nonzero_after)) if len(nonzero_after) > 1 else float("nan")
+
+    val_zero_classes = [name for name, count in val_counts.items() if count == 0]
+
+    lines = []
+    lines.append("=" * 70)
+    lines.append(f"FOLD {fold_number} - MULTICLASS")
+    lines.append("=" * 70)
+    lines.append(f"Window size: {window_size}")
+    lines.append(f"Train patients: {n_train_patients} | windows before augmentation: {total_before}")
+    lines.append(f"Val patients:   {n_val_patients} | windows (untouched): {sum(val_counts.values())}")
+    lines.append(f"Train/val patient overlap: {n_overlapping_patients} {'(OK)' if n_overlapping_patients == 0 else '!! LEAKAGE !!'}")
+    lines.append("")
+    lines.append("Class distribution (train, before GAN augmentation):")
+    lines.append(_fmt_counts(train_counts_before))
+    lines.append(f"  Imbalance ratio (max/min, excluding empty classes): {imbalance_before:.2f}")
+    lines.append("")
+
+    if augmentation_report:
+        lines.append("GAN augmentation (train-fold patients only):")
+        for row in augmentation_report:
+            lines.append(
+                f"    {row['class']:>3}: {row['count_before']:5d} real ({row['n_patients_used']} patients)"
+                f" + {row['n_generated']:4d} synthetic -> {row['count_after']:5d}"
+            )
+    else:
+        lines.append("GAN augmentation: skipped (no eligible minority class needed topping up, or disabled)")
+    lines.append("")
+
+    lines.append("Class distribution (train, after augmentation):")
+    lines.append(_fmt_counts(train_counts_after))
+    lines.append(f"  Imbalance ratio (max/min, excluding empty classes): {imbalance_after:.2f}")
+    lines.append(f"  Total train windows: {total_before} -> {total_after} ({total_after - total_before:+d}, {(total_after / total_before - 1) * 100:+.2f}%)")
+    lines.append("")
+
+    lines.append("Class distribution (validation, unchanged):")
+    lines.append(_fmt_counts(val_counts))
+    if val_zero_classes:
+        lines.append(f"  WARNING: no validation windows for class(es) {val_zero_classes} - metrics for this class are undefined this fold")
+    lines.append("")
+
+    lines.append("Classifier results:")
+    lines.append(f"  Best epoch: {fold_metrics['best_epoch']}")
+    lines.append(f"  Train Acc: {fold_metrics['train_acc']:.4f} | Train Loss: {fold_metrics['train_loss']:.4f}")
+    lines.append(f"  Val Acc:   {fold_metrics['val_acc']:.4f} | Val Loss:   {fold_metrics['val_loss']:.4f}")
+    lines.append(f"  Val AUC:   {fold_metrics['val_auc']:.4f}")
+    lines.append(f"  F1 Score:  {fold_metrics['f1_score']:.4f}")
+    lines.append("")
+
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+    with open(report_path, "a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def write_multiclass_summary_report(report_path, metrics_df, best_fold):
+    """
+    Appends a final cross-validation summary block after all folds finish.
+
+    Parameters:
+        - report_path: path to the same .txt file used by write_fold_report
+        - metrics_df: DataFrame loaded from outputs/metrics.csv (per-fold classifier metrics)
+        - best_fold: fold number with the lowest validation loss
+    """
+    lines = []
+    lines.append("=" * 70)
+    lines.append("MULTICLASS CROSS-VALIDATION SUMMARY")
+    lines.append("=" * 70)
+    lines.append(f"Folds run: {len(metrics_df)}")
+    lines.append(f"Mean Val Loss: {metrics_df['Val Loss'].mean():.4f} (std {metrics_df['Val Loss'].std():.4f})")
+    lines.append(f"Mean Val Acc:  {metrics_df['Val Acc'].mean():.4f} (std {metrics_df['Val Acc'].std():.4f})")
+    lines.append(f"Mean Val AUC:  {metrics_df['Val AUC'].mean():.4f} (std {metrics_df['Val AUC'].std():.4f})")
+    lines.append(f"Mean F1 Score: {metrics_df['F1 Score'].mean():.4f} (std {metrics_df['F1 Score'].std():.4f})")
+    lines.append(f"Best fold: {best_fold} (lowest Val Loss = {metrics_df['Val Loss'].min():.4f})")
+    lines.append("=" * 70)
+    lines.append("")
+
+    with open(report_path, "a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
 def train_binary_stage(args):
     print("STAGE 1: BINARY CLASSIFICATION (Normal vs. Abnormal)")
 
@@ -196,6 +455,9 @@ def train_binary_stage(args):
     with open("outputs/metrics_binary.csv", "w", newline="") as f:
         csv.writer(f).writerow(["Fold", "Best Epoch", "Train Acc", "Val Acc", "Train Loss", "Val Loss", "Val AUC", "F1 Score"])
 
+    fold_splits_path = "outputs/fold_splits_binary.json"
+    fold_splits = {"window_size": window_size, "folds": []}
+
     sgkf = StratifiedGroupKFold(n_splits=args.Folds, shuffle=True, random_state=args.random_seed)
     fold_number = 0
 
@@ -206,6 +468,8 @@ def train_binary_stage(args):
         X_test_raw = X_data[test_idx]
         y_train_raw = y_encoded[train_idx]
         y_test_raw = y_encoded[test_idx]
+        groups_train = groups[train_idx]
+        groups_val = groups[test_idx]
 
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train_raw)
@@ -333,6 +597,14 @@ def train_binary_stage(args):
                 best_f1_score,
             ])
 
+        fold_splits["folds"].append({
+            "fold": fold_number,
+            "train_record_ids": sorted(set(groups_train.tolist())),
+            "val_record_ids": sorted(set(groups_val.tolist())),
+        })
+        with open(fold_splits_path, "w", encoding="utf-8") as handle:
+            json.dump(fold_splits, handle, indent=2)
+
         plot_loss(history, fold_number, stage="binary")
         fold_number += 1
 
@@ -386,6 +658,16 @@ def train_multiclass_stage(args):
     with open("outputs/metrics.csv", "w", newline="") as f:
         csv.writer(f).writerow(["Fold", "Best Epoch", "Train Acc", "Val Acc", "Train Loss", "Val Loss", "Val AUC", "F1 Score"])
 
+    report_path = "outputs/fold_report_multiclass.txt"
+    if os.path.exists(report_path):
+        os.remove(report_path)
+
+    fold_splits_path = "outputs/fold_splits_multiclass.json"
+    fold_splits = {"window_size": window_size, "folds": []}
+
+    def _class_counts(y_arr):
+        return {name: int(np.sum(y_arr == idx)) for idx, name in enumerate(encoder.classes_)}
+
     sgkf = StratifiedGroupKFold(n_splits=args.Folds, shuffle=True, random_state=args.random_seed)
     fold_number = 0
 
@@ -396,6 +678,24 @@ def train_multiclass_stage(args):
         X_test_raw = X_data[test_idx]
         y_train_raw = y_encoded[train_idx]
         y_test_raw = y_encoded[test_idx]
+        groups_train = groups[train_idx]
+        groups_val = groups[test_idx]
+
+        train_counts_before = _class_counts(y_train_raw)
+        val_counts = _class_counts(y_test_raw)
+        n_train_patients = len(np.unique(groups_train))
+        n_val_patients = len(np.unique(groups_val))
+        n_overlapping_patients = len(np.intersect1d(groups_train, groups_val))
+
+        # Validation partition (X_test_raw / y_test_raw) is never touched below -
+        # only train-fold patients (groups_train) ever reach the GAN.
+        augmentation_report = []
+        if not args.skip_gan_augmentation:
+            X_train_raw, y_train_raw, augmentation_report = augment_fold_with_gan(
+                X_train_raw, y_train_raw, groups_train, encoder, window_size, fold_number, args
+            )
+
+        train_counts_after = _class_counts(y_train_raw)
 
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train_raw)
@@ -526,11 +826,42 @@ def train_multiclass_stage(args):
                 best_f1_score,
             ])
 
+        write_fold_report(
+            report_path=report_path,
+            fold_number=fold_number,
+            window_size=window_size,
+            train_counts_before=train_counts_before,
+            train_counts_after=train_counts_after,
+            val_counts=val_counts,
+            n_train_patients=n_train_patients,
+            n_val_patients=n_val_patients,
+            n_overlapping_patients=n_overlapping_patients,
+            augmentation_report=augmentation_report,
+            fold_metrics={
+                "best_epoch": best_epoch + 1,
+                "train_acc": best_train_acc,
+                "val_acc": best_val_acc,
+                "train_loss": best_train_loss,
+                "val_loss": best_val_loss,
+                "val_auc": best_val_auc,
+                "f1_score": best_f1_score,
+            },
+        )
+
+        fold_splits["folds"].append({
+            "fold": fold_number,
+            "train_record_ids": sorted(set(groups_train.tolist())),
+            "val_record_ids": sorted(set(groups_val.tolist())),
+        })
+        with open(fold_splits_path, "w", encoding="utf-8") as handle:
+            json.dump(fold_splits, handle, indent=2)
+
         plot_loss(history, fold_number, stage="multiclass")
         fold_number += 1
 
     metrics_df = pd.read_csv("outputs/metrics.csv")
     best_fold = int(metrics_df.loc[metrics_df["Val Loss"].idxmin(), "Fold"])
+    write_multiclass_summary_report(report_path, metrics_df, best_fold)
     best_val = metrics_df["Val Loss"].min()
     mean_val_loss = metrics_df["Val Loss"].mean()
     mean_val_acc = metrics_df["Val Acc"].mean()

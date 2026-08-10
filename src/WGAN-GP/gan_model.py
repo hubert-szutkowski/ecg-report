@@ -2,72 +2,70 @@ import tensorflow as tf
 from tensorflow.keras import layers, models, Model, Sequential
 import numpy as np
 
+
+class MinibatchStdDev(layers.Layer):
+    def call(self, inputs):
+        mean = tf.reduce_mean(inputs, axis=0, keepdims=True)
+        variance = tf.reduce_mean(tf.square(inputs - mean), axis=0, keepdims=True)
+        stddev = tf.sqrt(variance + 1e-8)
+        mean_stddev = tf.reduce_mean(stddev)
+        shape = tf.shape(inputs)
+        feature_map = tf.fill([shape[0], shape[1], 1], mean_stddev)
+        return tf.concat([inputs, feature_map], axis=-1)
+
+
+
 def build_generator(window_size=216, latent_dim=100):
-    
     upsampling_factor = 2 ** 3
-    
-    
     base_length = int(np.ceil(window_size / upsampling_factor))
     generated_length = base_length * upsampling_factor
-    
+
     z = layers.Input(shape=(latent_dim,))
 
-    
     x = layers.Dense(base_length * 32)(z)
     x = layers.Reshape((base_length, 32))(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
-    # Block 1: x2
-    x = layers.UpSampling1D(2)(x)
-    x = layers.Conv1D(64, kernel_size=7, padding="same")(x)
+    x = layers.Conv1DTranspose(64, kernel_size=8, strides=2, padding="same")(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
     x = layers.Dropout(0.3)(x)
 
-    # Block 2: x2
-    x = layers.UpSampling1D(2)(x)
-    x = layers.Conv1D(32, kernel_size=5, padding="same")(x)
+    x = layers.Conv1DTranspose(32, kernel_size=6, strides=2, padding="same")(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
     x = layers.Dropout(0.3)(x)
 
-    # Block 3: x2
-    x = layers.UpSampling1D(2)(x)
-    x = layers.Conv1D(16, kernel_size=3, padding="same")(x)
+    x = layers.Conv1DTranspose(16, kernel_size=4, strides=2, padding="same")(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
-    
     if generated_length > window_size:
         crop_size = generated_length - window_size
         x = layers.Cropping1D(cropping=(0, crop_size))(x)
 
-    
     output = layers.Conv1D(1, kernel_size=3, padding="same", activation="linear")(x)
-    
     return Model(z, output, name="dynamic_slim_generator")
+
 
 def build_critic(input_shape=(216, 1)):
     inp = layers.Input(shape=input_shape)
 
-    # 216 -> 108
     x = layers.Conv1D(32, kernel_size=7, strides=2, padding="same")(inp)
     x = layers.LeakyReLU(0.2)(x)
 
-    # 108 -> 54
     x = layers.Conv1D(64, kernel_size=5, strides=2, padding="same")(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
-    # 54 -> 27
     x = layers.Conv1D(128, kernel_size=3, strides=2, padding="same")(x)
     x = layers.LayerNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
 
     x = layers.Flatten()(x)
     x = layers.Dropout(0.3)(x)
-    
+
     out = layers.Dense(1, activation="linear")(x)
     return Model(inp, out, name="slim_critic")
 
@@ -133,9 +131,9 @@ class WGANGP(Model):
         with tf.GradientTape() as tape:
             fake_samples = self.generator(random_latent_vectors, training=True)
             gen_logits = self.critic(fake_samples, training=True)
-            
+
             g_loss = -tf.reduce_mean(gen_logits)
-            
+
         gen_gradient = tape.gradient(g_loss, self.generator.trainable_variables)
         self.g_optimizer.apply_gradients(zip(gen_gradient, self.generator.trainable_variables))
 

@@ -11,11 +11,12 @@ import tensorflow as tf
 import sys
 
 from itertools import combinations
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler, LabelEncoder, MinMaxScaler
 from sklearn.decomposition import PCA
 from tslearn.metrics import dtw
 from fastdtw import fastdtw
-
+from dtaidistance import dtw
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 MULTICLASS_DIR = os.path.join(os.path.dirname(CURRENT_DIR), "MultiClass")
@@ -27,107 +28,131 @@ from multiclass_preprocessing import get_record_ids, get_multiclass_data, get_gl
 
 from gan_model import WGANGP, build_generator, build_critic
 
-parser = argparse.ArgumentParser(description="WGAN-GP Training Pipeline for ECG Augmentation")
-parser.add_argument("--data-dir", type=str, required=True, help="Path to raw ECG data")
-parser.add_argument("--target-class", type=str, required=True, default="V", help="Class label to train the GAN on (e.g., 'V', 'S', or '2')")
-parser.add_argument("--selected-samples", type=int, default=20, help="Number of ECG records to load")
-parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs (GANs need more!)")
-parser.add_argument("--batch-size", type=int, default=128, help="Batch size for training")
-parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
-parser.add_argument("--start-learning-rate", type=float, default=5e-5, help="Learning rate for WGAN-GP (default 0.00005)")
-parser.add_argument("--latent-dim", type=int, default=32, help="Dimension of the latent noise vector")
-args = parser.parse_args()
+N_FOLD_SPLITS = 5
 
-mlflow.log_params({
-    "epochs": args.epochs,
-    "target_class": args.target_class,
-    "selected_samples": args.selected_samples,
-    "random_seed": args.random_seed,
-    "batch_size": args.batch_size,
-    "latent_dim": args.latent_dim,
-    "learning_rate": args.start_learning_rate,
-    "model_type": "WGAN-GP_1D"
-})
 
-# def calculate_real_dtw_baseline(real_signals):
-#     """
-#     Compute pairwise DTW distances between all real signals and return mean, median, and std.
-#     """
-#     n_samples = real_signals.shape[0]
-#     dtw_distances = []
-    
-#     for idx1, idx2 in combinations(range(n_samples), 2):
-#         sig1 = real_signals[idx1].squeeze()
-#         sig2 = real_signals[idx2].squeeze()
-        
-#         distance, _ = fastdtw(sig1, sig2)
-#         dtw_distances.append(distance)
-#         print(f"Computed DTW between sample {idx1} and {idx2}: {distance:.4f}")
-        
-#     dtw_distances = np.array(dtw_distances)
-    
-#     metrics = {
-#         "mean_real_dtw": np.mean(dtw_distances),
-#         "median_real_dtw": np.median(dtw_distances),
-#         "std_real_dtw": np.std(dtw_distances)
-#     }
-    
-#     return metrics
+def _prepare(signals: np.ndarray) -> np.ndarray:
+    return np.asarray([s.squeeze().astype(np.float64) for s in signals])
+
+
+def dtw_within_set(signals: np.ndarray, max_samples: int = 100, window: int | None = 20) -> dict:
+    """
+    Mean/median/std of pairwise DTW within one set (real-real or synthetic-synthetic).
+
+    Parameters:
+        - signals: np.ndarray of shape (n_samples, n_timesteps, 1)
+        - max_samples: int, maximum number of samples to consider for pairwise DTW
+        - window: int or None, the Sakoe-Chiba window size for DTW
+    Returns:
+        - dict with keys: mean, median, std, n_pairs
+    """
+    signals = _prepare(signals)
+    if len(signals) > max_samples:
+        idx = np.random.choice(len(signals), max_samples, replace=False)
+        signals = signals[idx]
+
+    dist_matrix = dtw.distance_matrix_fast(signals, window=window, parallel=True)
+    upper_triangle = dist_matrix[np.triu_indices(len(signals), k=1)]
+
+    return {
+        "mean": float(np.mean(upper_triangle)),
+        "median": float(np.median(upper_triangle)),
+        "std": float(np.std(upper_triangle)),
+        "n_pairs": len(upper_triangle),
+    }
+
+
+def dtw_cross_set(real_signals: np.ndarray, synthetic_signals: np.ndarray, max_samples: int = 100, window: int | None = 20) -> dict:
+    """
+    Mean/median/std of pairwise DTW between two different sets (real vs synthetic).
+
+    Parameters:
+        - real_signals: np.ndarray of shape (n_real_samples, n_timesteps, 1)
+        - synthetic_signals: np.ndarray of shape (n_synthetic_samples, n_timesteps, 1)
+        - max_samples: int, maximum number of samples to consider for pairwise DTW
+        - window: int or None, the Sakoe-Chiba window size for DTW
+    Returns:
+        - dict with keys: mean, median, std, n_pairs
+    """
+    real = _prepare(real_signals)
+    synth = _prepare(synthetic_signals)
+
+    if len(real) > max_samples:
+        real = real[np.random.choice(len(real), max_samples, replace=False)]
+    if len(synth) > max_samples:
+        synth = synth[np.random.choice(len(synth), max_samples, replace=False)]
+
+    combined = np.vstack([real, synth])
+    n_real = len(real)
+
+    full_matrix = dtw.distance_matrix_fast(combined, window=window, parallel=True)
+    cross_block = full_matrix[:n_real, n_real:]  # real rows x synthetic columns
+
+    return {
+        "mean": float(np.mean(cross_block)),
+        "median": float(np.median(cross_block)),
+        "std": float(np.std(cross_block)),
+        "n_pairs": cross_block.size,
+    }
 
 
 class WGANMonitor(tf.keras.callbacks.Callback):
     def __init__(self, real_samples, num_samples=4, latent_dim=100, save_dir='outputs/wgan_samples', class_name=""):
         super().__init__()
-        self.num_samples = num_samples
+        self.num_samples = min(num_samples, len(real_samples))
         self.latent_dim = latent_dim
         self.save_dir = save_dir
         self.class_name = class_name
-        
+
         # Pick fixed real samples
         np.random.seed(42)
         idx = np.random.choice(len(real_samples), self.num_samples, replace=False)
         self.real_samples = real_samples[idx]
-        
+
         # Build fixed latent vectors
-        self.fixed_latent_vectors = tf.random.normal(shape=(num_samples, latent_dim))
-        
+        self.fixed_latent_vectors = tf.random.normal(shape=(self.num_samples, latent_dim))
+
         os.makedirs(self.save_dir, exist_ok=True)
 
     def on_epoch_end(self, epoch, logs=None):
         if epoch == 0 or (epoch + 1) % 10 == 0:
             # Generate samples
             generated_signals = self.model.generator(self.fixed_latent_vectors, training=False).numpy()
-            
+
             # Draw a 2 x num_samples grid
             fig, axes = plt.subplots(2, self.num_samples, figsize=(15, 6))
             fig.suptitle(f'ECG comparison (Class: {self.class_name}) - Epoch {epoch + 1}', fontsize=14)
-            
+
             for i in range(self.num_samples):
                 # Top row: real ECG
                 axes[0, i].plot(self.real_samples[i, :, 0], color='green')
                 axes[0, i].set_title(f"Real {i+1}")
-                axes[0, i].set_ylim([-4, 4]) 
+                axes[0, i].set_ylim([-4, 4])
                 axes[0, i].grid(True, linestyle='--', alpha=0.6)
-                
+
                 # Bottom row: generated ECG
                 axes[1, i].plot(generated_signals[i, :, 0], color='blue')
                 axes[1, i].set_title(f"Generated {i+1}")
-                axes[1, i].set_ylim([-4, 4]) 
+                axes[1, i].set_ylim([-4, 4])
                 axes[1, i].grid(True, linestyle='--', alpha=0.6)
-                
+
             plt.tight_layout()
-            
+
             filepath = os.path.join(self.save_dir, f'epoch_{epoch+1:03d}.png')
             plt.savefig(filepath)
             plt.close(fig)
 
 
 class MLflowWGANCallback(tf.keras.callbacks.Callback):
-    """Log WGAN metrics to MLflow."""
+    """Log WGAN metrics to MLflow, namespaced so parallel per-class/per-fold runs don't collide."""
+    def __init__(self, metric_prefix=""):
+        super().__init__()
+        self.metric_prefix = metric_prefix
+
     def on_epoch_end(self, epoch, logs=None):
         if logs:
-            mlflow.log_metric("d_loss", logs.get("d_loss", 0), step=epoch)
-            mlflow.log_metric("g_loss", logs.get("g_loss", 0), step=epoch)
+            mlflow.log_metric(f"{self.metric_prefix}d_loss", logs.get("d_loss", 0), step=epoch)
+            mlflow.log_metric(f"{self.metric_prefix}g_loss", logs.get("g_loss", 0), step=epoch)
 
 
 class EpochWeightsSaver(tf.keras.callbacks.Callback):
@@ -142,37 +167,67 @@ class EpochWeightsSaver(tf.keras.callbacks.Callback):
             # separate paths for generator and critic weights
             gen_path = self.filepath.format(epoch=epoch + 1).replace('.weights.h5', '_generator.weights.h5')
             crit_path = self.filepath.format(epoch=epoch + 1).replace('.weights.h5', '_critic.weights.h5')
-            
+
             # Save weights separately
             self.model.generator.save_weights(gen_path)
             self.model.critic.save_weights(crit_path)
-            
+
             print(f"\n[Checkpoint] Saved (Generator, Critic) weights for epoch {epoch + 1}")
 
-class ECGSampleSaver(tf.keras.callbacks.Callback):
-    def __init__(self, latent_dim, output_dir="checkpoints/plots", interval=50):
+
+class DTWDiversityCallback(tf.keras.callbacks.Callback):
+    """
+    Every `every_n_epochs`, generates synthetic samples from the current
+    generator and computes real-real, synth-synth, and real-synth DTW
+    distance statistics, logging them to MLflow.
+    """
+
+    def __init__(self, real_signals: np.ndarray, latent_dim: int, every_n_epochs: int = 10,
+                 n_generate: int = 100, max_samples: int = 100, window: int | None = 20, metric_prefix: str = ""):
         super().__init__()
+        self.real_signals = real_signals
         self.latent_dim = latent_dim
-        self.output_dir = output_dir
-        self.interval = interval
-        self.fixed_noise = tf.random.normal([4, self.latent_dim]) 
-        os.makedirs(self.output_dir, exist_ok=True)
+        self.every_n_epochs = every_n_epochs
+        self.n_generate = n_generate
+        self.max_samples = max_samples
+        self.window = window
+        self.metric_prefix = metric_prefix
+        self.best_ratio = -np.inf
 
     def on_epoch_end(self, epoch, logs=None):
-        if (epoch + 1) % self.interval == 0:
-            generated_signals = self.model.generator(self.fixed_noise, training=False)
-            generated_signals = generated_signals.numpy()
-            
-            fig, axs = plt.subplots(4, 1, figsize=(10, 8))
-            for i in range(4):
-                axs[i].plot(generated_signals[i, :, 0], color='blue')
-                axs[i].set_ylim([-3, 3]) 
-            
-            plt.tight_layout()
-            plt.savefig(f"{self.output_dir}/epoch_{epoch+1}.png")
-            plt.close()
+        if (epoch + 1) % self.every_n_epochs != 0:
+            return
 
-def plot_wgan_losses(history, target_class):
+        z = tf.random.normal(shape=(self.n_generate, self.latent_dim))
+        synthetic = self.model.generator(z, training=False).numpy()
+
+        real_stats = dtw_within_set(self.real_signals, max_samples=self.max_samples, window=self.window)
+        synth_stats = dtw_within_set(synthetic, max_samples=self.max_samples, window=self.window)
+        cross_stats = dtw_cross_set(self.real_signals, synthetic, max_samples=self.max_samples, window=self.window)
+
+        diversity_ratio = synth_stats["mean"] / (real_stats["mean"] + 1e-8)
+        self.best_ratio = max(self.best_ratio, diversity_ratio)
+
+        metrics = {
+            f"{self.metric_prefix}dtw_real_real_mean": real_stats["mean"],
+            f"{self.metric_prefix}dtw_synth_synth_mean": synth_stats["mean"],
+            f"{self.metric_prefix}dtw_real_synth_mean": cross_stats["mean"],
+            f"{self.metric_prefix}dtw_diversity_ratio": diversity_ratio,
+        }
+        mlflow.log_metrics(metrics, step=epoch)
+
+        print(
+            f"[Epoch {epoch + 1}] real-real={real_stats['mean']:.2f} "
+            f"synth-synth={synth_stats['mean']:.2f} real-synth={cross_stats['mean']:.2f} "
+            f"diversity_ratio={diversity_ratio:.3f}"
+        )
+
+    def on_train_end(self, logs=None):
+        if self.best_ratio > -np.inf:
+            mlflow.log_metric(f"{self.metric_prefix}best_dtw_diversity_ratio", self.best_ratio)
+
+
+def plot_wgan_losses(history, target_class, output_dir="outputs"):
     """Plot generator and critic loss."""
     d_loss = history.history['d_loss']
     g_loss = history.history['g_loss']
@@ -186,38 +241,25 @@ def plot_wgan_losses(history, target_class):
     plt.ylabel('Loss')
     plt.legend()
     plt.grid(True)
-    plt.savefig(f'outputs/wgan_loss_curve_class_{target_class}.png')
+    plt.savefig(f'{output_dir}/wgan_loss_curve_class_{target_class}.png')
     plt.close()
 
-def evaluate_distribution_pca(real_signals, fake_signals):
-    
+def evaluate_distribution_pca(real_signals, fake_signals, output_dir="outputs"):
+
     real_flat = real_signals.reshape(real_signals.shape[0], -1)
     fake_flat = fake_signals.reshape(fake_signals.shape[0], -1)
-    
+
     pca = PCA(n_components=2)
     real_pca = pca.fit_transform(real_flat)
-    fake_pca = pca.transform(fake_flat) 
-    
+    fake_pca = pca.transform(fake_flat)
+
     plt.scatter(real_pca[:, 0], real_pca[:, 1], alpha=0.5, label='Real')
     plt.scatter(fake_pca[:, 0], fake_pca[:, 1], alpha=0.5, label='Generated')
     plt.legend()
     plt.title("PCA: Real vs Generated ECG")
-    plt.savefig("outputs/pca_evaluation.png")
+    plt.savefig(f"{output_dir}/pca_evaluation.png")
     plt.close()
 
-def calculate_mean_dtw(real_signals, fake_signals, n_samples=100):
-    """
-    Computing mean DTW distance between random pairs of real and generated signals.
-    """
-    distances = []
-    for i in range(n_samples):
-
-        idx_real = np.random.randint(0, real_signals.shape[0])
-        idx_fake = np.random.randint(0, fake_signals.shape[0])
-        d = dtw(real_signals[idx_real, :, 0], fake_signals[idx_fake, :, 0])
-        distances.append(d)
-        
-    return np.mean(distances)  
 
 def load_all_multiclass_data(data_dir: str, num_records: int, random_seed: int):
     # Load data with IQR downsampling.
@@ -231,29 +273,29 @@ def load_all_multiclass_data(data_dir: str, num_records: int, random_seed: int):
             X_all.append(X_record)
             y_all.append(y_record)
             groups_all.extend([record_ids[i]] * len(X_record))
-            
+
     X_master = np.vstack(X_all) if X_all else np.array([])
     y_master = np.concatenate(y_all) if y_all else np.array([])
     groups_master = np.array(groups_all)
-    
+
     if len(y_master) == 0:
         return X_master, y_master, groups_master
 
     rng = np.random.default_rng(random_seed)
     valid_indices = []
-    
+
     for cls in np.unique(y_master):
         cls_mask = (y_master == cls)
         patients_with_cls = groups_master[cls_mask]
         unique_patients, counts = np.unique(patients_with_cls, return_counts=True)
-        
+
         q1 = np.percentile(counts, 25)
         q3 = np.percentile(counts, 75)
         iqr = q3 - q1
-        
+
         dynamic_limit = int(np.ceil(q3 + 1.5 * iqr))
-        dynamic_limit = max(dynamic_limit, 30) 
-        
+        dynamic_limit = max(dynamic_limit, 30)
+
         for patient in unique_patients:
             patient_cls_idx = np.where((y_master == cls) & (groups_master == patient))[0]
             if len(patient_cls_idx) > dynamic_limit:
@@ -264,118 +306,199 @@ def load_all_multiclass_data(data_dir: str, num_records: int, random_seed: int):
     return X_master[valid_indices], y_master[valid_indices], groups_master[valid_indices], global_distance
 
 
-os.makedirs('outputs/wgan_samples', exist_ok=True)
+def train_gan_and_generate(
+    X_real_class: np.ndarray,
+    groups_real_class: np.ndarray,
+    n_samples_to_generate: int,
+    window_size: int,
+    target_class_name: str,
+    fold: int,
+    epochs: int = 500,
+    d_steps: int = 3,
+    gp_weight: float = 10.0,
+    latent_dim: int = 32,
+    batch_size: int = 32,
+    critic_lr_multiplier: float = 3.0,
+    start_learning_rate: float = 5e-5,
+    random_seed: int = 42,
+    output_dir: str = "outputs",
+) -> np.ndarray:
+    """
+    Trains a WGAN-GP on real ECG windows of a single AAMI class and returns
+    synthetic windows in the original (unscaled) amplitude space, ready to be
+    concatenated with real training data.
 
-# Load and parse data
-X_DATA, Y_LABELS, GROUPS, window_size = load_all_multiclass_data(args.data_dir, args.selected_samples, args.random_seed)
-print(X_DATA.shape, Y_LABELS.shape, GROUPS.shape)
-mlflow.log_metrics({"window_size": window_size})
-# Align label types
-encoder = LabelEncoder()
-Y_ENCODED = encoder.fit_transform(Y_LABELS)
-joblib.dump(encoder, 'outputs/label_encoder_wgan.pkl')
+    X_real_class / groups_real_class must already be restricted to the
+    current fold's TRAINING patients only (never pass validation-fold
+    patients here) so synthetic samples never leak validation morphology
+    into training.
 
-print(f"\nTotal extracted windows in dataset: {len(X_DATA)}")
-print(f"Detected classes: {encoder.classes_}")
-print(f"Window size used: {window_size}")
+    Parameters:
+        - X_real_class: np.ndarray (n, window_size, 1), raw real windows for one class, train-fold patients only
+        - groups_real_class: np.ndarray (n,), patient/record id per row in X_real_class
+        - n_samples_to_generate: how many synthetic windows to produce
+        - window_size, target_class_name, fold: context used for outputs/metrics naming
+        - epochs, d_steps, gp_weight, latent_dim, batch_size, critic_lr_multiplier, start_learning_rate: GAN hyperparameters
+        - random_seed: shuffling/reproducibility seed
+        - output_dir: base directory for sample plots and loss curves
+    Returns:
+        - np.ndarray (n_samples_to_generate, window_size, 1) of synthetic windows, unscaled
+    """
+    if len(X_real_class) == 0:
+        raise ValueError(f"No real samples provided for class '{target_class_name}' (fold {fold}).")
 
-# Filter the target class
-try:
-    # Resolve class index safely
-    if args.target_class.isdigit():
-        target_encoded_idx = int(args.target_class)
-    else:
-        target_encoded_idx = encoder.transform([args.target_class])[0]
-except ValueError:
-    raise ValueError(f"Class '{args.target_class}' not found in dataset classes: {encoder.classes_}")
+    n_patients = len(np.unique(groups_real_class))
+    print(f"[GAN] class={target_class_name} fold={fold}: {len(X_real_class)} windows from {n_patients} unique patients (train-fold only)")
 
-target_mask = (Y_ENCODED == target_encoded_idx)
-X_minority = X_DATA[target_mask]
-print(f"Isolated {len(X_minority)} samples for target class: {args.target_class} (Encoded: {target_encoded_idx})")
+    run_label = f"{target_class_name}_fold{fold}"
+    class_dir = os.path.join(output_dir, "wgan_samples", run_label)
 
-if len(X_minority) == 0:
-    raise ValueError("No samples found for the target class!")
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_real_class.reshape(-1, 1)).reshape(-1, window_size, 1).astype(np.float32)
 
-# Scale the data
-scaler = StandardScaler()
-X_minority_flattened = X_minority.reshape(-1,1)
-X_minority_scaled = scaler.fit_transform(X_minority_flattened)
-joblib.dump(scaler, f'outputs/wgan_scaler_class_{args.target_class}.pkl')
+    train_dataset = (
+        tf.data.Dataset.from_tensor_slices(X_scaled)
+        .shuffle(buffer_size=len(X_scaled), seed=random_seed, reshuffle_each_iteration=True)
+        .batch(batch_size)
+    )
 
-# Reshape for conv layers
-X_dataset_w = X_minority_scaled.reshape(-1, window_size, 1).astype(np.float32)
-#baseline_metrics = calculate_real_dtw_baseline(X_dataset_w)
-#print(baseline_metrics)
-# Build models
-print("Building Generator and Critic...")
-generator = build_generator(window_size=window_size, latent_dim=args.latent_dim)
-critic = build_critic(input_shape=(window_size, 1))
+    generator = build_generator(window_size=window_size, latent_dim=latent_dim)
+    critic = build_critic(input_shape=(window_size, 1))
 
-wgan = WGANGP(
-    generator=generator, 
-    critic=critic, 
-    latent_dim=args.latent_dim,
-    d_steps=5,
-    gp_weight=10.0
-)
+    wgan = WGANGP(generator=generator, critic=critic, latent_dim=latent_dim, d_steps=d_steps, gp_weight=gp_weight)
 
-# Use WGAN Adam settings
-generator_optimizer = tf.keras.optimizers.Adam(learning_rate=args.start_learning_rate, beta_1=0.0, beta_2=0.9)
-critic_optimizer = tf.keras.optimizers.Adam(learning_rate=3*args.start_learning_rate, beta_1=0.0, beta_2=0.9)
+    generator_optimizer = tf.keras.optimizers.Adam(learning_rate=start_learning_rate, beta_1=0.0, beta_2=0.9)
+    critic_optimizer = tf.keras.optimizers.Adam(learning_rate=critic_lr_multiplier * start_learning_rate, beta_1=0.0, beta_2=0.9)
+    wgan.compile(d_optimizer=critic_optimizer, g_optimizer=generator_optimizer)
 
-wgan.compile(
-    d_optimizer=critic_optimizer,
-    g_optimizer=generator_optimizer
-)
+    metric_prefix = f"gan_{run_label}_"
+    callbacks = [
+        WGANMonitor(num_samples=4, latent_dim=latent_dim, save_dir=class_dir, class_name=target_class_name, real_samples=X_scaled),
+        MLflowWGANCallback(metric_prefix=metric_prefix),
+        EpochWeightsSaver(filepath=os.path.join(class_dir, "wgan_epoch_{epoch:03d}.weights.h5"), interval=50),
+        DTWDiversityCallback(real_signals=X_scaled, latent_dim=latent_dim, every_n_epochs=10, metric_prefix=metric_prefix),
+    ]
 
+    print(f"\n{'='*50}\nTraining WGAN-GP | class={target_class_name} fold={fold}\n{'='*50}")
+    history = wgan.fit(train_dataset, epochs=epochs, callbacks=callbacks, verbose=1)
+    plot_wgan_losses(history, run_label, output_dir=output_dir)
 
-# Configure callbacks
-callbacks = [
-    # Save sample plots
-    WGANMonitor(num_samples=4, latent_dim=args.latent_dim, save_dir='outputs/wgan_samples', class_name=args.target_class, real_samples=X_dataset_w),
-    MLflowWGANCallback(),
-    ECGSampleSaver(latent_dim=args.latent_dim, output_dir='outputs/wgan_samples', interval=50),
-    EpochWeightsSaver(filepath="checkpoints/weights/wgan_epoch_{epoch:03d}.weights.h5", interval=50)
-]
+    noise = tf.random.normal(shape=(n_samples_to_generate, latent_dim))
+    X_synthetic_scaled = wgan.generator.predict(noise, batch_size=batch_size)
+    X_synthetic = scaler.inverse_transform(X_synthetic_scaled.reshape(-1, 1)).reshape(-1, window_size, 1).astype(np.float32)
 
-print(f"\n{'='*50}")
-print(f"STARTING WGAN-GP TRAINING FOR CLASS: {args.target_class}")
-print(f"{'='*50}")
-
-history = wgan.fit(
-    X_dataset_w,
-    batch_size=args.batch_size,
-    epochs=args.epochs,
-    callbacks=callbacks,
-    verbose=1
-)
-
-test_noise = np.random.normal(0, 1, size=(1000, args.latent_dim))
-X_synthetic = wgan.generator.predict(test_noise, batch_size=args.batch_size)
+    print(f"[GAN] Generated {len(X_synthetic)} synthetic windows for class {target_class_name} (fold {fold})")
+    return X_synthetic
 
 
-print("Computing evaluation metrics for generated samples...")
+def build_parser():
+    parser = argparse.ArgumentParser(description="WGAN-GP Training Pipeline for ECG Augmentation")
+    parser.add_argument("--data-dir", type=str, required=True, help="Path to raw ECG data")
+    parser.add_argument("--aami-class", type=str, required=True, help="AAMI class label to train the GAN on (e.g., 'S', 'V', 'F', 'Q')")
+    parser.add_argument("--fold", type=int, required=True, help=f"Fold index (0-{N_FOLD_SPLITS - 1}) from StratifiedGroupKFold to train on")
+    parser.add_argument("--selected-samples", type=int, default=20, help="Number of ECG records to load")
+    parser.add_argument("--n-generate", type=int, default=1000, help="Number of synthetic samples to generate")
+    parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs (GANs need more!)")
+    parser.add_argument("--d-steps", type=int, default=3, help="Number of critic updates per generator update")
+    parser.add_argument("--gp-weight", type=float, default=10.0, help="Gradient penalty weight")
+    parser.add_argument("--latent-dim", type=int, default=32, help="Dimension of the latent noise vector")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for training")
+    parser.add_argument("--critic-lr-multiplier", type=float, default=3.0, help="Critic learning rate as a multiple of --start-learning-rate")
+    parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--start-learning-rate", type=float, default=5e-5, help="Generator learning rate for WGAN-GP (default 0.00005)")
+    return parser
 
-# PCA evaluation
-evaluate_distribution_pca(X_dataset_w, X_synthetic)
 
-# DTW evaluation
-mean_dtw = calculate_mean_dtw(X_dataset_w, X_synthetic, n_samples=100)
+def main():
+    args = build_parser().parse_args()
 
-# Register metrics in MLflow
-mlflow.log_metric("final_mean_dtw", mean_dtw)
+    mlflow.log_params({
+        "epochs": args.epochs,
+        "aami_class": args.aami_class,
+        "fold": args.fold,
+        "selected_samples": args.selected_samples,
+        "random_seed": args.random_seed,
+        "d_steps": args.d_steps,
+        "gp_weight": args.gp_weight,
+        "batch_size": args.batch_size,
+        "latent_dim": args.latent_dim,
+        "learning_rate": args.start_learning_rate,
+        "critic_lr_multiplier": args.critic_lr_multiplier,
+        "model_type": "WGAN-GP_1D"
+    })
 
-print(f"Final mean DTW: {mean_dtw:.4f}")
+    os.makedirs('outputs/wgan_samples', exist_ok=True)
 
-# Save outputs
-plot_wgan_losses(history, args.target_class)
+    # Load and parse data
+    X_DATA, Y_LABELS, GROUPS, window_size = load_all_multiclass_data(args.data_dir, args.selected_samples, args.random_seed)
+    print(X_DATA.shape, Y_LABELS.shape, GROUPS.shape)
+    mlflow.log_metrics({"window_size": window_size})
 
-# Save generator only
-generator_path = f"./outputs/wgan_generator_class_{args.target_class}.keras"
-wgan.generator.save(generator_path)
+    # Align label types
+    encoder = LabelEncoder()
+    Y_ENCODED = encoder.fit_transform(Y_LABELS)
+    joblib.dump(encoder, 'outputs/label_encoder_wgan.pkl')
 
-print(f"\n{'='*50}")
-print("WGAN TRAINING COMPLETE")
-print(f"Generator saved to: {generator_path}")
-print(f"Scaler saved to: outputs/wgan_scaler_class_{args.target_class}.pkl")
-print(f"View loss curves in 'outputs/' and generated samples in 'outputs/wgan_samples/'")
+    print(f"\nTotal extracted windows in dataset: {len(X_DATA)}")
+    print(f"Detected classes: {encoder.classes_}")
+    print(f"Window size used: {window_size}")
+
+    # Split into folds (StratifiedGroupKFold, grouped by patient/record)
+    if not (0 <= args.fold < N_FOLD_SPLITS):
+        raise ValueError(f"--fold must be in [0, {N_FOLD_SPLITS}), got {args.fold}")
+
+    sgkf = StratifiedGroupKFold(n_splits=N_FOLD_SPLITS, shuffle=True, random_state=args.random_seed)
+    fold_splits = list(sgkf.split(X_DATA, Y_ENCODED, GROUPS))
+    train_idx, _ = fold_splits[args.fold]
+
+    X_fold_train = X_DATA[train_idx]
+    Y_fold_train = Y_ENCODED[train_idx]
+    GROUPS_fold_train = GROUPS[train_idx]
+    print(f"Fold {args.fold}: {len(train_idx)} windows / {len(np.unique(GROUPS_fold_train))} unique patients in training partition")
+
+    try:
+        if args.aami_class.isdigit():
+            target_encoded_idx = int(args.aami_class)
+        else:
+            target_encoded_idx = encoder.transform([args.aami_class])[0]
+    except ValueError:
+        raise ValueError(f"Class '{args.aami_class}' not found in dataset classes: {encoder.classes_}")
+
+    target_mask = (Y_fold_train == target_encoded_idx)
+    X_minority = X_fold_train[target_mask]
+    groups_minority = GROUPS_fold_train[target_mask]
+    print(f"Isolated {len(X_minority)} samples for AAMI class: {args.aami_class} (Encoded: {target_encoded_idx}, fold {args.fold})")
+
+    if len(X_minority) == 0:
+        raise ValueError("No samples found for the target class in this fold!")
+
+    X_synthetic = train_gan_and_generate(
+        X_real_class=X_minority,
+        groups_real_class=groups_minority,
+        n_samples_to_generate=args.n_generate,
+        window_size=window_size,
+        target_class_name=args.aami_class,
+        fold=args.fold,
+        epochs=args.epochs,
+        d_steps=args.d_steps,
+        gp_weight=args.gp_weight,
+        latent_dim=args.latent_dim,
+        batch_size=args.batch_size,
+        critic_lr_multiplier=args.critic_lr_multiplier,
+        start_learning_rate=args.start_learning_rate,
+        random_seed=args.random_seed,
+    )
+
+    print("Computing evaluation metrics for generated samples...")
+    evaluate_distribution_pca(X_minority, X_synthetic)
+
+    np.save(f"outputs/wgan_synthetic_class_{args.aami_class}_fold_{args.fold}.npy", X_synthetic)
+
+    print(f"\n{'='*50}")
+    print("WGAN TRAINING COMPLETE")
+    print(f"Synthetic samples saved to: outputs/wgan_synthetic_class_{args.aami_class}_fold_{args.fold}.npy")
+    print(f"View loss curves and generated samples in 'outputs/'")
+
+
+if __name__ == "__main__":
+    main()

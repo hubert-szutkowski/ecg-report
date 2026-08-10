@@ -2,6 +2,7 @@ tensorflow
 scikit-learn
 pandas
 numpy
+scipy
 wfdb
 matplotlib
 joblib
