@@ -18,6 +18,7 @@ Azure/
 eggs/
 .eggs/
 outputs/
+docs/next_steps_prompt.md
 checkpoints/
 *.keras
 *.pkl
