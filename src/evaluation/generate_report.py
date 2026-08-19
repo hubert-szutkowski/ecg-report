@@ -31,6 +31,7 @@ from pan_tompkins import pan_tompkins_detect
 from multistage_preprocessing import get_record_ids, SYMBOL_TO_CLASS
 from multistage_train import load_data
 from multistage_model import PositionalEmbedding
+from threshold_calibration import calibrate_binary_threshold
 
 CLINICAL_CLASS_ORDER = ["N", "S", "V", "F", "Q"]
 COMPUTE_SKU = "Standard_DS3_v2"  # matches Azure/submit_job.py's cpu-cluster instance size
@@ -49,6 +50,7 @@ def build_parser():
     parser.add_argument("--champion-model-name", type=str, default="ecg_multiclass_model", help="Registered model name to compare against")
     parser.add_argument("--metric-name", type=str, default="cascade_macro_f1", help="Metric that drives the promotion decision")
     parser.add_argument("--tolerance-samples", type=int, default=5, help="Peak-matching tolerance in samples, shared by 1.1 and 1.9")
+    parser.add_argument("--target-sensitivity", type=float, default=0.90, help="Minimum Stage 1 sensitivity used to pick the calibrated binary threshold (section 1.10)")
     parser.add_argument("--output-dir", type=str, default="outputs", help="Where to write the report/metrics/figures")
     return parser
 
@@ -88,7 +90,7 @@ def load_fold_artifacts(train_outputs_dir: str, stage: str, fold_number: int):
 
 
 def load_full_dataset(data_dir: str, stage: str, run_params: dict, expected_window_size: int, encoder=None):
-    X_data, y_labels, groups, window_size = load_data(
+    X_data, y_labels, groups, window_size, _ = load_data(
         data_dir, run_params["selected_samples"], run_params["random_seed"], stage
     )
     if window_size != expected_window_size:
@@ -185,7 +187,7 @@ def evaluate_binary_fold(train_outputs_dir, X_data, y_encoded, groups, fold_spli
 
     return {
         "fold": fold, "confusion_matrix": cm, "sensitivity": sensitivity, "specificity": specificity,
-        "ppv": ppv, "npv": npv,
+        "ppv": ppv, "npv": npv, "y_true": y_val, "y_pred_probs": y_pred_probs,
     }
 
 
@@ -341,7 +343,7 @@ def evaluate_pan_tompkins(data_dir, record_ids, tolerance_samples):
 
 # --- 1.1 end-to-end cascade ---
 
-def section_cascade_end_to_end(data_dir, train_outputs_dir, binary_splits, multiclass_splits, encoder, window_size, tolerance_samples):
+def section_cascade_end_to_end(data_dir, train_outputs_dir, binary_splits, multiclass_splits, encoder, window_size, tolerance_samples, binary_threshold: float = 0.5):
     all_true, all_pred = [], []
     loss_breakdown = {"missed_by_detector": 0, "classified_normal_by_stage1": 0, "misclassified_stage2": 0, "correctly_classified": 0}
     n_records_evaluated = 0
@@ -376,7 +378,7 @@ def section_cascade_end_to_end(data_dir, train_outputs_dir, binary_splits, multi
             try:
                 cascade_result = cascade.run_cascade_batch(
                     signal[:, 0].astype(np.float32), fs, binary_model=binary_model, scaler=binary_scaler,
-                    multiclass_model=multiclass_model, window_size=window_size,
+                    multiclass_model=multiclass_model, window_size=window_size, binary_threshold=binary_threshold,
                 )
             except ValueError:
                 continue
@@ -804,6 +806,41 @@ def build_markdown_report(sections: dict) -> str:
     lines.append(f"Aggregate sensitivity: {pt_aggregate['sensitivity']:.4f} | Aggregate PPV: {pt_aggregate['ppv']:.4f}")
     lines.append("")
 
+    lines += ["## 1.10 Binary threshold calibration", ""]
+    calib = sections["threshold_calibration"]
+    lines.append(
+        f"Target sensitivity: {calib['target_sensitivity']:.2f}. For each fold, the most specific "
+        "threshold that still meets the target is picked from that fold's held-out validation "
+        "predictions (no retraining); the recommended threshold below is the median across folds."
+    )
+    lines.append("")
+    lines.append(_markdown_table(
+        ["fold", "threshold", "target_met", "sensitivity", "specificity", "ppv", "npv"],
+        [[r["fold"], r["threshold"], str(r["target_met"]), r["sensitivity"], r["specificity"], r["ppv"], r["npv"]]
+         for r in calib["per_fold"]],
+    ))
+    lines.append("")
+    lines.append(f"Recommended threshold (median across folds): {calib['recommended_threshold']:.4f}")
+    lines.append("")
+    lines.append("Aggregate binary metrics, fixed 0.5 vs. recommended threshold:")
+    fixed = sections["binary_clinical"]["aggregate"]
+    recommended = calib["aggregate_at_recommended_threshold"]
+    lines.append(_markdown_table(
+        ["metric", "at 0.5", "at recommended"],
+        [["Sensitivity", fixed["sensitivity"], recommended["sensitivity"]],
+         ["Specificity", fixed["specificity"], recommended["specificity"]],
+         ["PPV", fixed["ppv"], recommended["ppv"]],
+         ["NPV", fixed["npv"], recommended["npv"]]],
+    ))
+    lines.append("")
+    lines.append("Effect on the full cascade (not just Stage 1 in isolation) - this is the number that matters:")
+    cascade_calibrated = sections["cascade_calibrated"]
+    lines.append(_markdown_table(
+        ["metric", "at 0.5", "at recommended"],
+        [["Cascade macro F1", cascade_section["report"]["macro avg"]["f1-score"], cascade_calibrated["report"]["macro avg"]["f1-score"]]],
+    ))
+    lines.append("")
+
     return "\n".join(lines)
 
 
@@ -859,11 +896,21 @@ def main():
     per_fold_table = section_per_fold_table(args.train_outputs_dir, multiclass_fold_results)
     aggregate_multiclass = section_aggregate_multiclass(multiclass_fold_results, encoder, num_classes)
     binary_clinical = section_binary_clinical_metrics(binary_fold_results)
+    threshold_calibration = calibrate_binary_threshold(binary_fold_results, target_sensitivity=args.target_sensitivity)
     baselines = section_baselines(X_bin, y_bin, groups_bin, binary_splits, X_multi, y_multi, groups_multi, multiclass_splits, encoder, num_classes, run_params["random_seed"])
     pan_tompkins_rows, pan_tompkins_aggregate = evaluate_pan_tompkins(args.data_dir, record_ids, args.tolerance_samples)
     cascade_section = section_cascade_end_to_end(
         args.data_dir, args.train_outputs_dir, binary_splits, multiclass_splits,
         encoder, window_size, args.tolerance_samples,
+    )
+    # Re-run the full cascade at the calibrated threshold too, not just the binary metrics in
+    # isolation - a higher Stage 1 sensitivity can still hurt cascade_macro_f1 if it floods
+    # Stage 2 with false positives, so this is the number that actually decides whether the
+    # calibrated threshold is worth adopting as the new default in cascade.py.
+    cascade_section_calibrated = section_cascade_end_to_end(
+        args.data_dir, args.train_outputs_dir, binary_splits, multiclass_splits,
+        encoder, window_size, args.tolerance_samples,
+        binary_threshold=threshold_calibration["recommended_threshold"],
     )
     gan_vs_nogan = section_gan_vs_nogan(args.train_outputs_dir, args.train_outputs_nogan_dir)
 
@@ -893,9 +940,11 @@ def main():
 
     sections = {
         "cascade": cascade_section,
+        "cascade_calibrated": cascade_section_calibrated,
         "aggregate_multiclass": aggregate_multiclass,
         "per_fold_table": per_fold_table,
         "binary_clinical": binary_clinical,
+        "threshold_calibration": threshold_calibration,
         "baselines": baselines,
         "gan_vs_nogan": gan_vs_nogan,
         "dataset_composition": dataset_composition,
@@ -912,14 +961,22 @@ def main():
         "cv_mean_val_auc": mlflow.get_run(args.train_job_name).data.metrics.get("cv_mean_val_auc"),
         "binary_sensitivity": binary_clinical["aggregate"]["sensitivity"],
         "binary_specificity": binary_clinical["aggregate"]["specificity"],
+        # Informational only - does NOT drive build_promotion_decision below, so promotion
+        # semantics against the registered champion (still scored at the fixed 0.5 threshold)
+        # don't silently change. Compare this to cascade_macro_f1 above to decide whether the
+        # calibrated threshold is worth adopting as cascade.py's new default.
+        "cascade_macro_f1_calibrated_threshold": cascade_section_calibrated["report"]["macro avg"]["f1-score"],
+        "calibrated_binary_threshold": threshold_calibration["recommended_threshold"],
     }
 
     metrics_json = _json_safe({
         "challenger_metrics": challenger_metrics,
         "cascade": cascade_section,
+        "cascade_calibrated": cascade_section_calibrated,
         "aggregate_multiclass": aggregate_multiclass,
         "per_fold_table": per_fold_table,
         "binary_clinical": binary_clinical,
+        "threshold_calibration": threshold_calibration,
         "baselines": baselines,
         "gan_vs_nogan": gan_vs_nogan,
         "dataset_composition": dataset_composition,

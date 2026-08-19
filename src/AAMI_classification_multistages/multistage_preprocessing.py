@@ -85,6 +85,13 @@ def get_data(dir_path: str, sample_select: int = 0, stage: str = 'binary', windo
         y (np.array):
             - for 'multiclass': 1D array with arrhythmia labels ('S', 'V', 'F', 'Q'), with 'N' removed
             - for 'binary': 1D array with integer labels (0 for N, 1 for anomaly)
+        y_subtype (np.array): the un-collapsed single-letter AAMI class per window
+            ('N'/'S'/'V'/'F'/'Q'), aligned with y. For 'multiclass' this is identical to y
+            (kept for a uniform return signature); for 'binary' it lets callers stratify CV
+            splits by AAMI subtype even though the training target itself stays binary -
+            StratifiedGroupKFold on the flattened 0/1 label is blind to subtype and can
+            concentrate one subtype (e.g. S, which is morphologically hard to tell from N)
+            almost entirely into one fold's validation split by chance.
     """
     records_ids  = get_record_ids(dir_path)
     record_path  = str(Path(dir_path) / str(records_ids[sample_select]))
@@ -96,6 +103,7 @@ def get_data(dir_path: str, sample_select: int = 0, stage: str = 'binary', windo
     signals, _ = wfdb.rdsamp(record_path, channels=[0])
 
     X, y = extract_AAMI_windows(signals, features_samples, features, window_size=window_size)
+    y_subtype = y.copy()
 
     if stage == 'binary':
         # Binary target
@@ -105,7 +113,8 @@ def get_data(dir_path: str, sample_select: int = 0, stage: str = 'binary', windo
         arrhythmia_mask = (y != 'N')
         X = X[arrhythmia_mask]
         y = y[arrhythmia_mask]
-    elif stage != 'multiclass':
+        y_subtype = y_subtype[arrhythmia_mask]
+    else:
         raise ValueError(f"Unsupported stage '{stage}'. Use 'binary' or 'multiclass'.")
 
     print(
@@ -114,7 +123,7 @@ def get_data(dir_path: str, sample_select: int = 0, stage: str = 'binary', windo
         f"Unique labels: {np.unique(y)}"
     )
 
-    return X, y
+    return X, y, y_subtype
 
 def get_global_window_size(dir_path: str, record_ids: list, scale_factor: float = 0.8) -> int:
     all_rr_distances = []
