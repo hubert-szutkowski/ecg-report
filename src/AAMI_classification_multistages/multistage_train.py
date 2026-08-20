@@ -559,7 +559,7 @@ def train_binary_stage(args):
         best_val_acc = history.history["val_accuracy"][best_epoch]
         best_train_acc = history.history["accuracy"][best_epoch]
         best_train_loss = history.history["loss"][best_epoch]
-        best_f1_score = history.history["macro_f1"][best_epoch]
+        best_f1_score = history.history["val_macro_f1"][best_epoch]
 
         y_pred_probs = model.predict(X_test_w, verbose=0).ravel()
         y_pred = (y_pred_probs >= 0.5).astype(np.int32)
@@ -785,7 +785,7 @@ def train_multiclass_stage(args):
         best_val_acc = history.history["val_accuracy"][best_epoch]
         best_train_acc = history.history["accuracy"][best_epoch]
         best_train_loss = history.history["loss"][best_epoch]
-        best_f1_score = history.history["macro_f1"][best_epoch]
+        best_f1_score = history.history["val_macro_f1"][best_epoch]
 
         y_pred_probs = model.predict(X_test_w, verbose=0)
         y_pred = np.argmax(y_pred_probs, axis=1)

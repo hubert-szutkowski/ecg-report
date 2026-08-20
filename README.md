@@ -10,7 +10,7 @@ Rather than focusing solely on model performance, the project emphasizes reprodu
 
 The system analyzes ECG recordings from the MIT-BIH Arrhythmia Database and serves predictions through a Streamlit application connected to a containerized inference API.
 
-> **Evaluation snapshot: 2026-08-10.** All numbers below come from a real evaluation job run against the live cascade (Pan-Tompkins → binary → multiclass) on held-out MIT-BIH patients — not training-time metrics. Re-running the evaluation pipeline against a newer training job will produce different numbers; this README reflects the most recent run only.
+> **Evaluation snapshot: 2026-08-20.** All numbers below come from a real evaluation job run against the live cascade (Pan-Tompkins → binary → multiclass) on held-out MIT-BIH patients — not training-time metrics, and reported with 95% bootstrap confidence intervals (resampled by patient, not by beat) rather than bare point estimates. Re-running the evaluation pipeline against a newer training job will produce different numbers; this README reflects the most recent run only.
 
 ---
 
@@ -179,35 +179,39 @@ This approach ensures consistent evaluation and repeatable experimentation.
 
 ## Cascade End-to-End Results (headline metric)
 
-This is the number that matters most: running the *actual* production pipeline (Pan-Tompkins detection → Stage 1 binary → Stage 2 multiclass) on 9 held-out full ECG records, matching detected peaks back to ground-truth annotations (±5 samples).
+This is the number that matters most: running the *actual* production pipeline (Pan-Tompkins detection → Stage 1 binary → Stage 2 multiclass) on held-out MIT-BIH patients, matching detected peaks back to ground-truth annotations (±5 samples).
+
+Earlier snapshots of this section evaluated only 9 (then 5) held-out records, because the binary and multiclass cross-validation folds are computed independently and a patient held out of *both* stages was found only by intersecting fold indices that happened to match — mostly by luck. That was fixed by pairing each patient with the specific binary/multiclass model pair that actually never saw them, regardless of fold index (`src/evaluation/fold_pairing.py`), recovering the full eligible population.
 
 | Metric | Value |
 | --- | --- |
-| **Cascade macro F1** | **0.2410** |
-| Cascade weighted F1 | 0.7609 |
-| Cascade accuracy | 0.7285 |
-| Records evaluated | 9 |
+| **Cascade macro F1** | **0.2792** (95% CI: 0.2206–0.3476) |
+| Cascade weighted F1 | 0.7464 |
+| Cascade accuracy | 0.7623 |
+| Records evaluated | 37 |
 
 Per-class breakdown at the cascade output:
 
 | Class | Precision | Recall | F1 | Support |
 | --- | --- | --- | --- | --- |
-| N | 0.9054 | 0.8270 | 0.8644 | 15,915 |
-| S | 0.0134 | 0.0962 | 0.0235 | 52 |
-| V | 0.0504 | 0.1725 | 0.0780 | 742 |
-| F | 0.0000 | 0.0000 | 0.0000 | 18 |
-| Q | 0.3044 | 0.1968 | 0.2391 | 2,088 |
+| N | 0.8615 | 0.9033 | 0.8819 | 62,127 |
+| S | 0.1606 | 0.0331 | 0.0549 | 1,056 |
+| V | 0.2209 | 0.3163 | 0.2601 | 5,564 |
+| F | 0.0000 | 0.0000 | 0.0000 | 778 |
+| Q | 0.2910 | 0.1512 | 0.1990 | 8,043 |
 
-**Where true anomalous beats are lost** (2,900 true anomalies total across the 9 records):
+All five classes now clear the 30-example support floor used elsewhere in this project (`--min-support-floor` in `generate_report.py`), so macro F1 above isn't being distorted by a class measured on a handful of examples — a real risk at the smaller record counts of earlier snapshots.
+
+**Where true anomalous beats are lost** (15,441 true anomalies total across the 37 patients):
 
 | Outcome | Count | Share |
 | --- | --- | --- |
-| Missed by the R-peak detector | 601 | 20.7% |
-| Detected, but classified Normal by Stage 1 | 774 | 26.7% |
-| Reached Stage 2, but misclassified | 981 | 33.8% |
-| Correctly classified end-to-end | 544 | **18.8%** |
+| Missed by the R-peak detector | 5,650 | 36.6% |
+| Detected, but classified Normal by Stage 1 | 3,373 | 21.8% |
+| Reached Stage 2, but misclassified | 3,407 | 22.1% |
+| Correctly classified end-to-end | 3,011 | **19.5%** |
 
-Only about 1 in 5 true anomalous beats survives the full cascade correctly, and the losses are spread fairly evenly across all three stages — this is not a single bottleneck, it's a compounding-error problem (see [Known Limitations](#known-limitations)).
+Still about 1 in 5 true anomalous beats survives the full cascade correctly — consistent with the very first (9-record) measurement's 18.8%, despite a completely different patient set and evaluation methodology, which is a reassuring sign that number is real rather than small-sample noise. What changed with fuller patient coverage is *where* the loss concentrates: the R-peak detector's share nearly doubled (20.7% → 36.6%), most likely because records 104 and 108 — already known from [Pan-Tompkins Detector Validation](#pan-tompkins-detector-validation) to have far worse detector sensitivity than the rest of the dataset — are now properly weighted in the full patient population instead of being absent or under-represented by chance. This re-prioritizes detector robustness above where it sat in earlier snapshots (see [Known Limitations](#known-limitations)).
 
 ![Confusion matrix](docs/img/confusion_matrix.png)
 
@@ -219,12 +223,14 @@ Clinical metrics, pooled across all 5 CV folds:
 
 | Metric | Value |
 | --- | --- |
-| Sensitivity (recall on anomalies) | **0.5768** |
-| Specificity | 0.8951 |
-| PPV | 0.4476 |
-| NPV | 0.9349 |
+| Sensitivity (recall on anomalies) | **0.6590** |
+| Specificity | 0.9031 |
+| PPV | 0.5004 |
+| NPV | 0.9473 |
 
-Stage 1 sensitivity is the ceiling on the whole cascade: it misses ~42% of true anomalies before they ever reach Stage 2, which alone accounts for more end-to-end loss than Stage 2's own misclassifications.
+Stage 1 sensitivity is the ceiling on the whole cascade: every anomaly missed here can never reach Stage 2. It was previously 0.5768 (specificity 0.8951) — the improvement came from fixing how the binary-stage cross-validation split is stratified. `StratifiedGroupKFold` was splitting on the flattened Normal-vs-anomaly label, which is blind to AAMI subtype; that let one CV fold accidentally concentrate ~60% of all class S beats (supraventricular ectopic — morphologically the hardest to distinguish from Normal) in its validation set, forcing a near-zero decision threshold just to detect them. Re-stratifying by AAMI subtype instead fixed this: sensitivity, specificity, and PPV all improved *simultaneously* (not a sensitivity/specificity trade-off), and no CV fold's AUC is catastrophically low anymore.
+
+**Recalibrating the decision threshold away from 0.5 was tried and rejected.** Two approaches were tested: (1) picking a threshold that hits 90% Stage 1 sensitivity in isolation, and (2) sweeping candidate thresholds through the *full* cascade and ranking by the resulting cascade macro F1. Both were measured against the real cascade output, not just Stage 1 metrics — approach (1) reliably *hurts* cascade macro F1 (0.2792 → 0.2359) by flooding Stage 2 with false positives from the resulting collapse in specificity; approach (2)'s best candidate (threshold 0.3) beat the 0.5 default by less than its own bootstrap confidence interval, i.e. within noise. The default threshold of 0.5 stays.
 
 ## Stage 2 — Multiclass (AAMI: S / V / F / Q)
 
@@ -232,29 +238,29 @@ Aggregate classification report across all 5 folds (window-level, not the cascad
 
 | Class | Precision | Recall | F1 | Support |
 | --- | --- | --- | --- | --- |
-| S | 0.5338 | 0.3410 | 0.4162 | 648 |
-| V | 0.4477 | 0.8651 | 0.5900 | 4,765 |
+| S | 0.5264 | 0.5231 | 0.5248 | 648 |
+| V | 0.5068 | 0.9018 | 0.6489 | 4,765 |
 | F | 0.0000 | 0.0000 | 0.0000 | 103 |
-| Q | 0.8363 | 0.4093 | 0.5496 | 8,041 |
+| Q | 0.8976 | 0.4936 | 0.6369 | 8,041 |
 
 | Metric | Value |
 | --- | --- |
-| Macro F1 | 0.3889 |
-| Weighted F1 | 0.5532 |
-| Accuracy | 0.5631 |
-| Mean CV AUC | 0.7819 |
+| Macro F1 | 0.4526 |
+| Weighted F1 | 0.6309 |
+| Accuracy | 0.6347 |
+| Mean CV AUC | 0.8586 |
 
-**Per-fold breakdown — variance is the dominant story here:**
+**Per-fold breakdown — variance is still the dominant story here.** Only the binary stage's CV stratification was fixed (see Stage 1 above); the multiclass split is unchanged and shows it:
 
 | Fold | Val Acc | Val AUC | Macro F1 | Weighted F1 |
 | --- | --- | --- | --- | --- |
-| 0 | 0.4388 | 0.5051 | 0.2851 | 0.4713 |
-| 1 | 0.9760 | 0.9922 | 0.6365 | 0.9716 |
-| 2 | 0.2166 | 0.6497 | 0.1086 | 0.1217 |
-| 3 | 0.8711 | 0.7827 | 0.3415 | 0.8719 |
-| 4 | 0.9739 | 0.9797 | 0.5010 | 0.9817 |
+| 0 | 0.8863 | 0.9866 | 0.6070 | 0.8884 |
+| 1 | 0.9814 | 0.9981 | 0.6716 | 0.9786 |
+| 2 | 0.1952 | 0.5214 | 0.1365 | 0.0711 |
+| 3 | 0.6884 | 0.8063 | 0.2731 | 0.7751 |
+| 4 | 0.9862 | 0.9803 | 0.5435 | 0.9891 |
 
-Val accuracy ranges from 0.22 to 0.98 across 5 folds of the *same* model and pipeline. Against majority-class and stratified-random baselines, the model clearly beats both in 4 of 5 folds — but **loses to both baselines in fold 2** (model macro F1 0.109 vs. baseline 0.218/0.226), which the aggregate numbers above would otherwise hide.
+Val accuracy ranges from 0.20 to 0.99 across 5 folds of the *same* model and pipeline. Against majority-class and stratified-random baselines, the model clearly beats both in 4 of 5 folds — but **loses to both baselines in fold 2** (model macro F1 0.137 vs. baseline 0.218/0.226), which the aggregate numbers above would otherwise hide. A local audit (`notebooks/class_distribution_audit.py`) traced this to the same root cause as the binary fix above, not yet applied to multiclass: a handful of "carrier" patients hold almost all of a given class's examples (e.g. 4 patients hold 99.8% of all class Q windows), so which fold they land in swings that fold's class balance heavily. Fold 2 specifically got carrier patients for *two* classes (Q and S) at once.
 
 ![Per-fold metrics](docs/img/per_fold_metrics.png)
 
@@ -271,6 +277,8 @@ Extended from an earlier 2-record spot check to 10 MIT-BIH records, tolerance ±
 
 Per-record, most are ≥0.97 sensitivity, but two records are notably worse — record 104 (0.5464) and record 108 (0.5026) — both known in the MIT-BIH literature for atypical/noisy morphology, suggesting the detector's fixed adaptive-threshold parameters don't generalize to every recording condition.
 
+These same two records turn out to matter more than this 10-record spot check alone suggests: once the [cascade evaluation](#cascade-end-to-end-results-headline-metric) covered its full eligible patient population instead of a small lucky subset, missed detections became the single largest category of lost anomalies (36.6% of all anomaly loss) — larger than either classification stage's own errors. Improving detector robustness on records like these is now a higher-priority lever than the original 2-record framing implied.
+
 ![Pan-Tompkins detection](docs/img/pan_tompkins_detection.png)
 
 ---
@@ -281,18 +289,18 @@ Measured on the training/evaluation compute (`Standard_DS3_v2`, 4 vCPU, CPU-only
 
 | Metric | Value |
 | --- | --- |
-| Mean Pan-Tompkins detection time | 0.039 s/record |
-| Mean Stage 1 (binary) inference time | 1.372 s/record |
-| Mean Stage 2 (multiclass) inference time | 0.644 s/record |
-| Per-beat latency (mean) | 1.03 ms |
-| Per-beat latency (p95) | 1.37 ms |
-| **Batched vs. per-window `predict()` speedup** | **~84x** |
+| Mean Pan-Tompkins detection time | 0.041 s/record |
+| Mean Stage 1 (binary) inference time | 1.314 s/record |
+| Mean Stage 2 (multiclass) inference time | 0.485 s/record |
+| Per-beat latency (mean) | 0.92 ms |
+| Per-beat latency (p95) | 1.29 ms |
+| **Batched vs. per-window `predict()` speedup** | **~88x** |
 | Binary model parameters | 438,081 |
 | Multiclass model parameters | 438,468 |
 | Binary model size | 5.4 MB |
 | Multiclass model size | 5.4 MB |
 
-The ~84x batching speedup quantifies the payoff of refactoring `run_stream` from sequential to batched inference in the FastAPI service.
+The ~88x batching speedup quantifies the payoff of refactoring `run_stream` from sequential to batched inference in the FastAPI service.
 
 ---
 
@@ -446,12 +454,12 @@ Implemented practices include:
 
 This section is deliberately blunt — these are measured findings from the evaluation snapshot above, not hypothetical caveats.
 
-* **Cascade macro F1 is low (0.24).** Only ~19% of true anomalous beats are classified correctly end-to-end; the rest are lost roughly evenly across detection (21%), Stage 1 false-negatives (27%), and Stage 2 misclassification (34%). This is a compounding-error problem across all three stages, not a single fixable bottleneck.
-* **Stage 1 sensitivity (0.577) is the practical ceiling on the whole system.** Improving it would have the largest single effect on cascade performance, since anomalies missed here can never reach Stage 2.
-* **Multiclass performance is highly unstable across folds** (val accuracy 0.22–0.98, same model/data pipeline). Fold 2 in particular has the model *losing* to a trivial majority-class baseline. With only 26–31 training patients per fold, individual patients' morphology dominates fold-to-fold results — this is a dataset-size/patient-heterogeneity problem, not primarily a modeling one.
-* **Class F (fusion beats) is not learned at all** — 0.0 precision and recall throughout, both at the window level and in the cascade. F has the fewest samples of any AAMI class (18 in the cascade evaluation set); the current data volume can't support learning it.
-* **WGAN-GP augmentation shows no measurable benefit** at current settings (mean Val Acc difference -0.011, within a ±0.347 inter-fold noise band) — see [WGAN-GP Case Study](#wgan-gp-case-study).
-* **The Pan-Tompkins detector degrades on atypical records** (0.50–0.55 sensitivity on 2 of 10 tested records vs. ~0.97+ on the rest) — its fixed thresholding doesn't generalize to every signal condition in MIT-BIH.
+* **Cascade macro F1 is low (0.28, 95% CI 0.22–0.35).** Only ~19.5% of true anomalous beats are classified correctly end-to-end; the rest are lost across detection (36.6%), Stage 1 false-negatives (21.8%), and Stage 2 misclassification (22.1%). This is a compounding-error problem across all three stages, not a single fixable bottleneck — and the detector is now the single largest contributor, not an equal third.
+* **Stage 1 sensitivity (0.659) has improved but is still the practical ceiling on the whole system.** Fixing the CV split's stratification (it was blind to AAMI subtype) raised it from 0.577 without trading away specificity or precision — but every anomaly still missed here can never reach Stage 2. Recalibrating the decision threshold away from 0.5 was tried two ways and rejected both times: it either measurably hurts cascade macro F1, or its apparent gain is within bootstrap noise (see Stage 1 above).
+* **Multiclass performance is highly unstable across folds** (val accuracy 0.20–0.99, same model/data pipeline). Fold 2 in particular has the model *losing* to a trivial majority-class baseline. Traced to a small number of patients holding almost all of a given class's examples (e.g. 4 patients hold 99.8% of class Q) — the same root cause as the binary-stage issue above, not yet fixed for multiclass.
+* **Class F (fusion beats) is not learned at all** — 0.0 precision and recall throughout, both at the window level and in the cascade. F has the fewest samples of any AAMI class; the current data volume can't support learning it.
+* **WGAN-GP augmentation shows no measurable benefit** at current settings (mean Val Acc difference -0.011, within a ±0.347 inter-fold noise band) — see [WGAN-GP Case Study](#wgan-gp-case-study). Measured before the binary CV stratification fix above; not yet re-validated against it.
+* **The Pan-Tompkins detector degrades on atypical records** (0.50–0.55 sensitivity on 2 of 10 tested records vs. ~0.97+ on the rest). At full cascade evaluation scale this is no longer a minor caveat: it's the largest single source of lost anomalies (36.6% of all cascade loss) — its fixed thresholding doesn't generalize to every signal condition in MIT-BIH.
 * **Small dataset overall**: `--selected-samples 40` records, which limits both training data volume and how representative each CV fold can be.
 
 ---
@@ -519,10 +527,10 @@ Potential applications include:
 
 ## In Progress
 
-* Improving Stage 1 sensitivity (currently the main cascade bottleneck)
-* Reducing multiclass fold-to-fold variance (likely needs more patients per fold, not just more augmentation)
+* Pan-Tompkins detector robustness on atypical records (now the single largest source of cascade loss at full evaluation scale — reprioritized above the other items below)
+* Improving Stage 1 sensitivity further (0.577 → 0.659 via CV stratification fix; still the practical ceiling on the cascade). Threshold recalibration away from 0.5 was tried and rejected — see Stage 1 above.
+* Reducing multiclass fold-to-fold variance by applying the same CV stratification fix used for Stage 1 (root cause confirmed the same: a few patients dominate a given class's examples)
 * Making WGAN-GP augmentation actually move the needle, or concluding it isn't the right lever for this dataset size
-* Pan-Tompkins detector robustness on atypical records
 
 ---
 
