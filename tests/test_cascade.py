@@ -111,14 +111,13 @@ class _FakeMulticlassModel:
         return probs
 
 
-def test_run_cascade_batch_gates_stage_two_on_binary_threshold(monkeypatch):
+def test_run_cascade_batch_gates_stage_two_on_binary_threshold():
     """
     Only windows the binary model flags as anomalous (>= threshold) should ever
     reach the multiclass model - this is the batching optimization run_stream
     was refactored around, so it must not regress into scoring every beat twice.
     """
     fake_peaks = np.array([200, 400, 600, 800])
-    monkeypatch.setattr(cascade, "pan_tompkins_detect", lambda signal, fs: fake_peaks)
 
     signal = np.sin(np.linspace(0, 20, 1000)).astype(np.float32)
     scaler = StandardScaler().fit(np.random.default_rng(0).normal(size=(50, 216)))
@@ -128,6 +127,7 @@ def test_run_cascade_batch_gates_stage_two_on_binary_threshold(monkeypatch):
     result = cascade.run_cascade_batch(
         signal, fs=250.0, binary_model=binary_model, scaler=scaler,
         multiclass_model=multiclass_model, window_size=216, binary_threshold=0.5,
+        peak_detector=lambda signal, fs: fake_peaks,
     )
 
     assert result["total_beats"] == 4

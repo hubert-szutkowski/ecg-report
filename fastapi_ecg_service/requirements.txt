@@ -4,6 +4,7 @@ pandas
 tensorflow
 python-multipart
 wfdb
+neurokit2
 requests
 scikit-learn
 joblib

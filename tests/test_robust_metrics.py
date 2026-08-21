@@ -5,7 +5,12 @@ import numpy as np
 from sklearn.metrics import classification_report
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/evaluation')))
-from robust_metrics import bootstrap_macro_f1_ci, macro_f1_with_support_floor, pick_best_cascade_threshold
+from robust_metrics import (
+    bootstrap_macro_f1_ci,
+    macro_f1_with_support_floor,
+    paired_bootstrap_macro_f1_diff_ci,
+    pick_best_cascade_threshold,
+)
 
 
 def _report(y_true, y_pred, labels):
@@ -116,3 +121,77 @@ def test_pick_best_cascade_threshold_ranks_by_floor_filtered_when_min_support_gi
 
     assert result["ranking_metric"] == "macro_f1_floor"
     assert result["best_threshold"] == 0.6
+
+
+def _make_paired_conditions(n_groups=30, seed=0, b_advantage=0.0):
+    """
+    Same patients under two conditions, with per-patient difficulty noise shared by both (so
+    an unpaired test would be confounded by it) and a controllable systematic advantage for B.
+    """
+    rng = np.random.default_rng(seed)
+    y_true_a, y_pred_a, groups_a = [], [], []
+    y_true_b, y_pred_b, groups_b = [], [], []
+    for g in range(n_groups):
+        patient = f"p{g}"
+        n = 20
+        difficulty = rng.uniform(0.0, 0.5)  # shared per-patient noise
+        true_g = rng.choice(["N", "V"], size=n, p=[0.7, 0.3])
+
+        acc_a = max(0.05, 0.9 - difficulty)
+        pred_a = np.where(rng.random(n) < acc_a, true_g, np.where(true_g == "N", "V", "N"))
+        y_true_a.extend(true_g); y_pred_a.extend(pred_a); groups_a.extend([patient] * n)
+
+        acc_b = max(0.05, min(0.99, 0.9 - difficulty + b_advantage))
+        pred_b = np.where(rng.random(n) < acc_b, true_g, np.where(true_g == "N", "V", "N"))
+        y_true_b.extend(true_g); y_pred_b.extend(pred_b); groups_b.extend([patient] * n)
+
+    return y_true_a, y_pred_a, groups_a, y_true_b, y_pred_b, groups_b
+
+
+def test_paired_bootstrap_diff_ci_centers_near_zero_when_conditions_are_identical():
+    y_true_a, y_pred_a, groups_a, _, _, _ = _make_paired_conditions(b_advantage=0.0)
+
+    result = paired_bootstrap_macro_f1_diff_ci(
+        y_true_a, y_pred_a, groups_a, y_true_a, y_pred_a, groups_a, ["N", "V"], n_bootstrap=200,
+    )
+
+    assert result["point_estimate"] == 0.0
+    assert result["ci_low"] <= 0.0 <= result["ci_high"]
+
+
+def test_paired_bootstrap_diff_ci_detects_consistent_advantage_despite_shared_noise():
+    y_true_a, y_pred_a, groups_a, y_true_b, y_pred_b, groups_b = _make_paired_conditions(
+        n_groups=30, seed=1, b_advantage=0.25,
+    )
+
+    result = paired_bootstrap_macro_f1_diff_ci(
+        y_true_a, y_pred_a, groups_a, y_true_b, y_pred_b, groups_b, ["N", "V"], n_bootstrap=300, random_state=5,
+    )
+
+    assert result["point_estimate"] > 0
+    assert result["ci_low"] > 0  # CI excludes zero - the paired test should catch this reliably
+    assert result["prob_b_better"] > 0.9
+
+
+def test_paired_bootstrap_diff_ci_reproducible_with_same_seed():
+    y_true_a, y_pred_a, groups_a, y_true_b, y_pred_b, groups_b = _make_paired_conditions(seed=2, b_advantage=0.1)
+
+    result1 = paired_bootstrap_macro_f1_diff_ci(
+        y_true_a, y_pred_a, groups_a, y_true_b, y_pred_b, groups_b, ["N", "V"], n_bootstrap=100, random_state=7,
+    )
+    result2 = paired_bootstrap_macro_f1_diff_ci(
+        y_true_a, y_pred_a, groups_a, y_true_b, y_pred_b, groups_b, ["N", "V"], n_bootstrap=100, random_state=7,
+    )
+
+    assert result1 == result2
+
+
+def test_paired_bootstrap_diff_ci_rejects_mismatched_patient_populations():
+    y_true_a, y_pred_a, groups_a, y_true_b, y_pred_b, groups_b = _make_paired_conditions(seed=3)
+    groups_b = ["different_patient_set"] * len(groups_b)
+
+    try:
+        paired_bootstrap_macro_f1_diff_ci(y_true_a, y_pred_a, groups_a, y_true_b, y_pred_b, groups_b, ["N", "V"])
+        assert False, "expected ValueError for mismatched patient populations"
+    except ValueError as exc:
+        assert "same patients" in str(exc)

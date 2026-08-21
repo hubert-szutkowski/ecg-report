@@ -348,7 +348,7 @@ def evaluate_pan_tompkins(data_dir, record_ids, tolerance_samples):
 
 # --- 1.1 end-to-end cascade ---
 
-def section_cascade_end_to_end(data_dir, train_outputs_dir, binary_splits, multiclass_splits, encoder, window_size, tolerance_samples, binary_threshold: float = 0.5):
+def section_cascade_end_to_end(data_dir, train_outputs_dir, binary_splits, multiclass_splits, encoder, window_size, tolerance_samples, binary_threshold: float = 0.5, peak_detector=None):
     all_true, all_pred, all_groups = [], [], []
     loss_breakdown = {"missed_by_detector": 0, "classified_normal_by_stage1": 0, "misclassified_stage2": 0, "correctly_classified": 0}
     n_records_evaluated = 0
@@ -385,10 +385,12 @@ def section_cascade_end_to_end(data_dir, train_outputs_dir, binary_splits, multi
             signal, fields = wfdb.rdsamp(record_path, channels=[0])
             fs = fields["fs"]
 
+            detector_kwargs = {"peak_detector": peak_detector} if peak_detector is not None else {}
             try:
                 cascade_result = cascade.run_cascade_batch(
                     signal[:, 0].astype(np.float32), fs, binary_model=binary_model, scaler=binary_scaler,
                     multiclass_model=multiclass_model, window_size=window_size, binary_threshold=binary_threshold,
+                    **detector_kwargs,
                 )
             except ValueError:
                 continue

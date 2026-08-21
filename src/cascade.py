@@ -3,9 +3,9 @@ import numpy as np
 # src/ is imported flat (Azure ML jobs, PYTHONPATH=.) and as the "src" package
 # (fastapi_ecg_service, which does `from src.cascade import ...`) - support both.
 try:
-    from pan_tompkins import pan_tompkins_detect
+    from pan_tompkins import pan_tompkins_detect, neurokit_detect
 except ImportError:
-    from src.pan_tompkins import pan_tompkins_detect
+    from src.pan_tompkins import pan_tompkins_detect, neurokit_detect
 
 
 def extract_windows_around_peaks(signal: np.ndarray, peak_indices: np.ndarray, window_size: int = 216):
@@ -37,11 +37,17 @@ def run_cascade_batch(
     window_size: int = 216,
     binary_threshold: float = 0.5,
     batch_size: int = 256,
+    peak_detector=neurokit_detect,
 ) -> dict:
+    # Default detector chosen after a multi-stage comparison (docs/peak_detection_benchmark_prompt.md,
+    # notebooks/outputs/peak_detector_cascade_comparison_report_*.md): a patient-paired bootstrap on
+    # the full cascade found neurokit_detect beats pan_tompkins_detect with the 95% CI excluding
+    # zero, replicated across two independent training runs, at comparable per-record latency.
+    # Pass peak_detector=pan_tompkins_detect (or any signal, fs -> np.ndarray callable) to override.
     if not np.all(np.isfinite(signal)):
         raise ValueError("Signal contains NaN or infinite values.")
 
-    peak_indices = pan_tompkins_detect(signal, fs)
+    peak_indices = peak_detector(signal, fs)
     windows_raw, valid_peaks = extract_windows_around_peaks(signal, peak_indices, window_size)
     if len(valid_peaks) == 0:
         raise ValueError("No valid beats found (peaks too close to signal boundaries).")
