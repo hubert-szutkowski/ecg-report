@@ -31,6 +31,9 @@ from pan_tompkins import pan_tompkins_detect
 from multistage_preprocessing import get_record_ids, SYMBOL_TO_CLASS
 from multistage_train import load_data
 from multistage_model import PositionalEmbedding
+from threshold_calibration import calibrate_binary_threshold
+from robust_metrics import bootstrap_macro_f1_ci, macro_f1_with_support_floor, pick_best_cascade_threshold
+from fold_pairing import group_patients_by_fold_pair
 
 CLINICAL_CLASS_ORDER = ["N", "S", "V", "F", "Q"]
 COMPUTE_SKU = "Standard_DS3_v2"  # matches Azure/submit_job.py's cpu-cluster instance size
@@ -49,6 +52,10 @@ def build_parser():
     parser.add_argument("--champion-model-name", type=str, default="ecg_multiclass_model", help="Registered model name to compare against")
     parser.add_argument("--metric-name", type=str, default="cascade_macro_f1", help="Metric that drives the promotion decision")
     parser.add_argument("--tolerance-samples", type=int, default=5, help="Peak-matching tolerance in samples, shared by 1.1 and 1.9")
+    parser.add_argument("--target-sensitivity", type=float, default=0.90, help="Minimum Stage 1 sensitivity used to pick the calibrated binary threshold (section 1.10, kept for comparison - see --threshold-candidates for the metric that now actually drives the recommendation)")
+    parser.add_argument("--min-support-floor", type=int, default=30, help="Classes with fewer than this many held-out examples are excluded from macro_f1_floor (matches the IQR-downsampling floor used elsewhere in this project)")
+    parser.add_argument("--n-bootstrap", type=int, default=500, help="Number of patient-level bootstrap resamples for cascade macro F1 confidence intervals")
+    parser.add_argument("--threshold-candidates", type=str, default="0.3,0.5,0.7", help="Comma-separated binary thresholds to run through the FULL cascade and rank by macro_f1_floor (section 1.11); 0.5 is always included even if omitted")
     parser.add_argument("--output-dir", type=str, default="outputs", help="Where to write the report/metrics/figures")
     return parser
 
@@ -88,7 +95,7 @@ def load_fold_artifacts(train_outputs_dir: str, stage: str, fold_number: int):
 
 
 def load_full_dataset(data_dir: str, stage: str, run_params: dict, expected_window_size: int, encoder=None):
-    X_data, y_labels, groups, window_size = load_data(
+    X_data, y_labels, groups, window_size, _ = load_data(
         data_dir, run_params["selected_samples"], run_params["random_seed"], stage
     )
     if window_size != expected_window_size:
@@ -185,7 +192,7 @@ def evaluate_binary_fold(train_outputs_dir, X_data, y_encoded, groups, fold_spli
 
     return {
         "fold": fold, "confusion_matrix": cm, "sensitivity": sensitivity, "specificity": specificity,
-        "ppv": ppv, "npv": npv,
+        "ppv": ppv, "npv": npv, "y_true": y_val, "y_pred_probs": y_pred_probs,
     }
 
 
@@ -341,26 +348,31 @@ def evaluate_pan_tompkins(data_dir, record_ids, tolerance_samples):
 
 # --- 1.1 end-to-end cascade ---
 
-def section_cascade_end_to_end(data_dir, train_outputs_dir, binary_splits, multiclass_splits, encoder, window_size, tolerance_samples):
-    all_true, all_pred = [], []
+def section_cascade_end_to_end(data_dir, train_outputs_dir, binary_splits, multiclass_splits, encoder, window_size, tolerance_samples, binary_threshold: float = 0.5, peak_detector=None):
+    all_true, all_pred, all_groups = [], [], []
     loss_breakdown = {"missed_by_detector": 0, "classified_normal_by_stage1": 0, "misclassified_stage2": 0, "correctly_classified": 0}
     n_records_evaluated = 0
 
-    multiclass_fold_by_number = {s["fold"]: s for s in multiclass_splits["folds"]}
+    # Each patient is paired with the specific (binary, multiclass) fold models that held THEM
+    # out, rather than assuming the two independently-computed CV splits agree at the same
+    # fold index - they usually don't (see fold_pairing.group_patients_by_fold_pair). Measured
+    # on a real run: the same-index assumption silently evaluated only 5 of ~37 eligible
+    # patients; this recovers the rest.
+    patients_by_fold_pair = group_patients_by_fold_pair(binary_splits["folds"], multiclass_splits["folds"])
 
-    for bin_split in binary_splits["folds"]:
-        fold = bin_split["fold"]
-        multi_split = multiclass_fold_by_number.get(fold)
-        if multi_split is None:
-            continue
-        record_ids = sorted(set(bin_split["val_record_ids"]) & set(multi_split["val_record_ids"]))
-        if not record_ids:
-            continue
+    binary_model_cache: dict[int, tuple] = {}
+    multiclass_model_cache: dict[int, tuple] = {}
 
-        binary_model, binary_scaler = load_fold_artifacts(train_outputs_dir, "binary", fold)
-        multiclass_model, _ = load_fold_artifacts(train_outputs_dir, "multiclass", fold)
+    for (binary_fold, multiclass_fold), record_ids in patients_by_fold_pair.items():
+        if binary_fold not in binary_model_cache:
+            binary_model_cache[binary_fold] = load_fold_artifacts(train_outputs_dir, "binary", binary_fold)
+        if multiclass_fold not in multiclass_model_cache:
+            multiclass_model_cache[multiclass_fold] = load_fold_artifacts(train_outputs_dir, "multiclass", multiclass_fold)
 
-        for record_id in record_ids:
+        binary_model, binary_scaler = binary_model_cache[binary_fold]
+        multiclass_model, _ = multiclass_model_cache[multiclass_fold]
+
+        for record_id in sorted(record_ids):
             record_path = os.path.join(data_dir, record_id)
             ann = wfdb.rdann(record_path, "atr")
             symbols = np.array(ann.symbol)
@@ -373,10 +385,12 @@ def section_cascade_end_to_end(data_dir, train_outputs_dir, binary_splits, multi
             signal, fields = wfdb.rdsamp(record_path, channels=[0])
             fs = fields["fs"]
 
+            detector_kwargs = {"peak_detector": peak_detector} if peak_detector is not None else {}
             try:
                 cascade_result = cascade.run_cascade_batch(
                     signal[:, 0].astype(np.float32), fs, binary_model=binary_model, scaler=binary_scaler,
-                    multiclass_model=multiclass_model, window_size=window_size,
+                    multiclass_model=multiclass_model, window_size=window_size, binary_threshold=binary_threshold,
+                    **detector_kwargs,
                 )
             except ValueError:
                 continue
@@ -392,6 +406,7 @@ def section_cascade_end_to_end(data_dir, train_outputs_dir, binary_splits, multi
                 loss_breakdown["missed_by_detector"] += 1
                 all_true.append(true_label)
                 all_pred.append("N")
+                all_groups.append(record_id)
 
             for a_idx, d_idx in zip(match["matched_annotated_idx"], match["matched_detected_idx"]):
                 true_label = annotated_labels[a_idx]
@@ -403,6 +418,7 @@ def section_cascade_end_to_end(data_dir, train_outputs_dir, binary_splits, multi
 
                 all_true.append(true_label)
                 all_pred.append(pred_label)
+                all_groups.append(record_id)
 
                 if true_label == "N":
                     continue
@@ -420,6 +436,7 @@ def section_cascade_end_to_end(data_dir, train_outputs_dir, binary_splits, multi
     return {
         "report": report, "confusion_matrix": cm, "confusion_matrix_labels": labels_present,
         "loss_breakdown": loss_breakdown, "n_records_evaluated": n_records_evaluated,
+        "y_true": np.array(all_true), "y_pred": np.array(all_pred), "groups": np.array(all_groups),
     }
 
 
@@ -700,6 +717,18 @@ def build_markdown_report(sections: dict) -> str:
     lines.append(_markdown_table(headers, rows))
     lines.append("")
     lines.append(f"Macro F1: {report['macro avg']['f1-score']:.4f}")
+    ci = sections["cascade_macro_f1_ci"]
+    lines.append(f"  - 95% bootstrap CI (resampled by patient, n={ci['n_bootstrap']}): [{ci['ci_low']:.4f}, {ci['ci_high']:.4f}]")
+    floor = sections["cascade_macro_f1_floor"]
+    lines.append(
+        f"Macro F1 (support >= {floor['min_support']} only): {floor['macro_f1_floor']:.4f} "
+        f"over {floor['included_classes']}"
+    )
+    floor_ci = sections["cascade_macro_f1_floor_ci"]
+    lines.append(f"  - 95% bootstrap CI: [{floor_ci['ci_low']:.4f}, {floor_ci['ci_high']:.4f}]")
+    if floor["excluded_classes"]:
+        excluded_str = ", ".join(f"{c['class']} (support={c['support']})" for c in floor["excluded_classes"])
+        lines.append(f"  - Excluded (below support floor, not measured reliably this run): {excluded_str}")
     lines.append("")
     lb = cascade_section["loss_breakdown"]
     lines.append("Where true anomalous beats are lost:")
@@ -804,6 +833,73 @@ def build_markdown_report(sections: dict) -> str:
     lines.append(f"Aggregate sensitivity: {pt_aggregate['sensitivity']:.4f} | Aggregate PPV: {pt_aggregate['ppv']:.4f}")
     lines.append("")
 
+    lines += ["## 1.10 Binary threshold calibration", ""]
+    calib = sections["threshold_calibration"]
+    lines.append(
+        f"Target sensitivity: {calib['target_sensitivity']:.2f}. For each fold, the most specific "
+        "threshold that still meets the target is picked from that fold's held-out validation "
+        "predictions (no retraining); the recommended threshold below is the median across folds."
+    )
+    lines.append("")
+    lines.append(_markdown_table(
+        ["fold", "threshold", "target_met", "sensitivity", "specificity", "ppv", "npv"],
+        [[r["fold"], r["threshold"], str(r["target_met"]), r["sensitivity"], r["specificity"], r["ppv"], r["npv"]]
+         for r in calib["per_fold"]],
+    ))
+    lines.append("")
+    lines.append(f"Recommended threshold (median across folds): {calib['recommended_threshold']:.4f}")
+    lines.append("")
+    lines.append("Aggregate binary metrics, fixed 0.5 vs. recommended threshold:")
+    fixed = sections["binary_clinical"]["aggregate"]
+    recommended = calib["aggregate_at_recommended_threshold"]
+    lines.append(_markdown_table(
+        ["metric", "at 0.5", "at recommended"],
+        [["Sensitivity", fixed["sensitivity"], recommended["sensitivity"]],
+         ["Specificity", fixed["specificity"], recommended["specificity"]],
+         ["PPV", fixed["ppv"], recommended["ppv"]],
+         ["NPV", fixed["npv"], recommended["npv"]]],
+    ))
+    lines.append("")
+    lines.append("Effect on the full cascade (not just Stage 1 in isolation) - superseded by section 1.11 below, kept here for comparison:")
+    cascade_calibrated = sections["cascade_calibrated"]
+    calibrated_floor = sections["cascade_calibrated_macro_f1_floor"]
+    lines.append(_markdown_table(
+        ["metric", "at 0.5", "at sensitivity-target threshold"],
+        [["Cascade macro F1", cascade_section["report"]["macro avg"]["f1-score"], cascade_calibrated["report"]["macro avg"]["f1-score"]],
+         ["Cascade macro F1 (floor)", sections["cascade_macro_f1_floor"]["macro_f1_floor"], calibrated_floor["macro_f1_floor"]]],
+    ))
+    lines.append("")
+
+    lines += ["## 1.11 Cascade-optimized threshold sweep", ""]
+    sweep = sections["cascade_threshold_sweep"]
+    lines.append(
+        "Instead of picking a threshold from a Stage 1-only proxy (section 1.10) and hoping it "
+        "helps the cascade, each candidate threshold below was run through the FULL cascade "
+        f"(Pan-Tompkins -> Stage 1 -> Stage 2), ranked by macro F1 restricted to classes with "
+        f"support >= {sweep['min_support']} (`{sweep['ranking_metric']}`)."
+    )
+    lines.append("")
+    lines.append(_markdown_table(
+        ["threshold", "cascade_macro_f1", "cascade_macro_f1_floor"],
+        [[c["threshold"], c["macro_f1"], c["macro_f1_floor"]] for c in sweep["candidates"]],
+    ))
+    lines.append("")
+    lines.append(f"**Recommended threshold: {sweep['best_threshold']}** (macro_f1_floor = {sweep['best_macro_f1_floor']:.4f})")
+    lines.append("")
+    best_ci = sweep["best_threshold_ci"]
+    best_floor_ci = sweep["best_threshold_floor_ci"]
+    lines.append(f"95% bootstrap CI at recommended threshold - macro F1: [{best_ci['ci_low']:.4f}, {best_ci['ci_high']:.4f}], macro F1 (floor): [{best_floor_ci['ci_low']:.4f}, {best_floor_ci['ci_high']:.4f}]")
+    lines.append("")
+    baseline_floor_ci = sections["cascade_macro_f1_floor_ci"]
+    if sweep["best_threshold"] == 0.5:
+        verdict = "0.5 (the current default) already wins the sweep - no change recommended."
+    elif best_floor_ci["ci_low"] > baseline_floor_ci["point_estimate"]:
+        verdict = f"Recommended threshold's CI is entirely above the 0.5 baseline's point estimate ({baseline_floor_ci['point_estimate']:.4f}) - likely a real improvement, not noise."
+    else:
+        verdict = "Recommended threshold's CI overlaps the 0.5 baseline - improvement is within noise, not conclusive at this sample size."
+    lines.append(f"Verdict: {verdict}")
+    lines.append("")
+
     return "\n".join(lines)
 
 
@@ -859,12 +955,76 @@ def main():
     per_fold_table = section_per_fold_table(args.train_outputs_dir, multiclass_fold_results)
     aggregate_multiclass = section_aggregate_multiclass(multiclass_fold_results, encoder, num_classes)
     binary_clinical = section_binary_clinical_metrics(binary_fold_results)
+    threshold_calibration = calibrate_binary_threshold(binary_fold_results, target_sensitivity=args.target_sensitivity)
     baselines = section_baselines(X_bin, y_bin, groups_bin, binary_splits, X_multi, y_multi, groups_multi, multiclass_splits, encoder, num_classes, run_params["random_seed"])
     pan_tompkins_rows, pan_tompkins_aggregate = evaluate_pan_tompkins(args.data_dir, record_ids, args.tolerance_samples)
     cascade_section = section_cascade_end_to_end(
         args.data_dir, args.train_outputs_dir, binary_splits, multiclass_splits,
         encoder, window_size, args.tolerance_samples,
     )
+    # Kept for comparison with section 1.11 below - this is the OLD approach (pick a threshold
+    # that hits a Stage 1 sensitivity target, in isolation, then hope it helps the cascade).
+    # Measured twice to actively hurt cascade_macro_f1 by flooding Stage 2 with false positives,
+    # which is why it's no longer what drives the recommended threshold (see section 1.11).
+    cascade_section_calibrated = section_cascade_end_to_end(
+        args.data_dir, args.train_outputs_dir, binary_splits, multiclass_splits,
+        encoder, window_size, args.tolerance_samples,
+        binary_threshold=threshold_calibration["recommended_threshold"],
+    )
+
+    # Floor-filtered macro F1 for both of the above: a class with a handful of held-out
+    # examples (e.g. Q with support=4 in one run) can single-handedly swing raw macro F1 to
+    # near-zero by chance - that's noise, not model quality. macro_f1_floor excludes classes
+    # below --min-support-floor and reports which ones, instead of silently averaging them in.
+    cascade_macro_f1_floor = macro_f1_with_support_floor(
+        cascade_section["report"], cascade_section["confusion_matrix_labels"], args.min_support_floor
+    )
+    cascade_calibrated_macro_f1_floor = macro_f1_with_support_floor(
+        cascade_section_calibrated["report"], cascade_section_calibrated["confusion_matrix_labels"], args.min_support_floor
+    )
+
+    # Patient-level bootstrap CI for the baseline (0.5) cascade result, both raw and
+    # floor-filtered - communicates whether a comparison against this run is a real difference
+    # or within noise, instead of presenting a single point estimate as if it were exact.
+    cascade_macro_f1_ci = bootstrap_macro_f1_ci(
+        cascade_section["y_true"], cascade_section["y_pred"], cascade_section["groups"],
+        cascade_section["confusion_matrix_labels"], min_support=None, n_bootstrap=args.n_bootstrap,
+    )
+    cascade_macro_f1_floor_ci = bootstrap_macro_f1_ci(
+        cascade_section["y_true"], cascade_section["y_pred"], cascade_section["groups"],
+        cascade_section["confusion_matrix_labels"], min_support=args.min_support_floor, n_bootstrap=args.n_bootstrap,
+    )
+
+    # 1.11: sweep binary thresholds through the FULL cascade (not a Stage-1-only proxy like
+    # sensitivity) and rank candidates by macro_f1_floor - this is what now actually picks the
+    # recommended threshold. 0.5 is reused from cascade_section above rather than recomputed.
+    threshold_candidates = sorted({0.5, *(float(t) for t in args.threshold_candidates.split(",") if t.strip())})
+    candidate_cascades = {0.5: cascade_section}
+    for t in threshold_candidates:
+        if t in candidate_cascades:
+            continue
+        candidate_cascades[t] = section_cascade_end_to_end(
+            args.data_dir, args.train_outputs_dir, binary_splits, multiclass_splits,
+            encoder, window_size, args.tolerance_samples, binary_threshold=t,
+        )
+    cascade_threshold_sweep = pick_best_cascade_threshold(
+        [{"threshold": t, "report": candidate_cascades[t]["report"]} for t in threshold_candidates],
+        class_names=cascade_section["confusion_matrix_labels"], min_support=args.min_support_floor,
+    )
+    best_threshold = cascade_threshold_sweep["best_threshold"]
+    best_cascade = candidate_cascades[best_threshold]
+
+    best_cascade_macro_f1_ci = bootstrap_macro_f1_ci(
+        best_cascade["y_true"], best_cascade["y_pred"], best_cascade["groups"],
+        best_cascade["confusion_matrix_labels"], min_support=None, n_bootstrap=args.n_bootstrap,
+    )
+    best_cascade_macro_f1_floor_ci = bootstrap_macro_f1_ci(
+        best_cascade["y_true"], best_cascade["y_pred"], best_cascade["groups"],
+        best_cascade["confusion_matrix_labels"], min_support=args.min_support_floor, n_bootstrap=args.n_bootstrap,
+    )
+    cascade_threshold_sweep["best_threshold_ci"] = best_cascade_macro_f1_ci
+    cascade_threshold_sweep["best_threshold_floor_ci"] = best_cascade_macro_f1_floor_ci
+
     gan_vs_nogan = section_gan_vs_nogan(args.train_outputs_dir, args.train_outputs_nogan_dir)
 
     binary_model_path = os.path.join(args.train_outputs_dir, "best_overall_binary_model.keras")
@@ -893,9 +1053,16 @@ def main():
 
     sections = {
         "cascade": cascade_section,
+        "cascade_calibrated": cascade_section_calibrated,
+        "cascade_macro_f1_floor": cascade_macro_f1_floor,
+        "cascade_calibrated_macro_f1_floor": cascade_calibrated_macro_f1_floor,
+        "cascade_macro_f1_ci": cascade_macro_f1_ci,
+        "cascade_macro_f1_floor_ci": cascade_macro_f1_floor_ci,
+        "cascade_threshold_sweep": cascade_threshold_sweep,
         "aggregate_multiclass": aggregate_multiclass,
         "per_fold_table": per_fold_table,
         "binary_clinical": binary_clinical,
+        "threshold_calibration": threshold_calibration,
         "baselines": baselines,
         "gan_vs_nogan": gan_vs_nogan,
         "dataset_composition": dataset_composition,
@@ -909,17 +1076,42 @@ def main():
 
     challenger_metrics = {
         "cascade_macro_f1": cascade_section["report"]["macro avg"]["f1-score"],
+        "cascade_macro_f1_ci_low": cascade_macro_f1_ci["ci_low"],
+        "cascade_macro_f1_ci_high": cascade_macro_f1_ci["ci_high"],
+        "cascade_macro_f1_floor": cascade_macro_f1_floor["macro_f1_floor"],
+        "cascade_macro_f1_floor_ci_low": cascade_macro_f1_floor_ci["ci_low"],
+        "cascade_macro_f1_floor_ci_high": cascade_macro_f1_floor_ci["ci_high"],
         "cv_mean_val_auc": mlflow.get_run(args.train_job_name).data.metrics.get("cv_mean_val_auc"),
         "binary_sensitivity": binary_clinical["aggregate"]["sensitivity"],
         "binary_specificity": binary_clinical["aggregate"]["specificity"],
+        # Informational only - none of the *_at_* / *_threshold metrics below drive
+        # build_promotion_decision, so promotion against the registered champion (still scored
+        # at the fixed 0.5 threshold) doesn't silently change semantics.
+        "cascade_macro_f1_floor_at_swept_threshold": cascade_threshold_sweep["best_macro_f1_floor"],
+        "swept_binary_threshold": cascade_threshold_sweep["best_threshold"],
+        # Kept for continuity with the now-superseded Stage-1-proxy approach (section 1.10).
+        "cascade_macro_f1_at_sensitivity_target_threshold": cascade_section_calibrated["report"]["macro avg"]["f1-score"],
+        "sensitivity_target_binary_threshold": threshold_calibration["recommended_threshold"],
     }
+
+    # y_true/y_pred/groups are per-beat arrays used for bootstrap CIs above - useful in memory,
+    # but not worth bloating metrics.json with thousands of raw labels, so strip them here.
+    def _strip_raw_arrays(cascade_dict):
+        return {k: v for k, v in cascade_dict.items() if k not in ("y_true", "y_pred", "groups")}
 
     metrics_json = _json_safe({
         "challenger_metrics": challenger_metrics,
-        "cascade": cascade_section,
+        "cascade": _strip_raw_arrays(cascade_section),
+        "cascade_calibrated": _strip_raw_arrays(cascade_section_calibrated),
+        "cascade_macro_f1_floor": cascade_macro_f1_floor,
+        "cascade_calibrated_macro_f1_floor": cascade_calibrated_macro_f1_floor,
+        "cascade_macro_f1_ci": cascade_macro_f1_ci,
+        "cascade_macro_f1_floor_ci": cascade_macro_f1_floor_ci,
+        "cascade_threshold_sweep": cascade_threshold_sweep,
         "aggregate_multiclass": aggregate_multiclass,
         "per_fold_table": per_fold_table,
         "binary_clinical": binary_clinical,
+        "threshold_calibration": threshold_calibration,
         "baselines": baselines,
         "gan_vs_nogan": gan_vs_nogan,
         "dataset_composition": dataset_composition,

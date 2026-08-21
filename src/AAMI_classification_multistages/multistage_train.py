@@ -145,25 +145,34 @@ def load_data(data_dir: str, num_records: int, random_seed: int, stage: str):
     """
     Loads ECG signal windows and their corresponding labels from the specified directory.
     Applies dynamic downsampling based on interquartile range (IQR) to balance the dataset.
+
+    Returns:
+        X, y, groups, window_size, y_subtype - y_subtype is the un-collapsed AAMI class per
+        window ('N'/'S'/'V'/'F'/'Q'), aligned with y and downsampled the same way as the rest.
+        For stage='multiclass' it is identical to y (kept only for a uniform return signature);
+        for stage='binary' it exists so callers can stratify CV splits by AAMI subtype instead
+        of the flattened 0/1 label (see get_data's docstring for why that matters).
     """
-    X_all, y_all, groups_all = [], [], []
+    X_all, y_all, y_subtype_all, groups_all = [], [], [], []
     record_ids = get_record_ids(data_dir)
     records_to_process = min(num_records, len(record_ids))
     window_size = get_global_window_size(data_dir, record_ids)
     print(f"Global window size determined: {window_size}")
     for i in range(records_to_process):
-        X_record, y_record = get_data(data_dir, sample_select=i, stage=stage, window_size=window_size)
+        X_record, y_record, y_subtype_record = get_data(data_dir, sample_select=i, stage=stage, window_size=window_size)
         if len(X_record) > 0:
             X_all.append(X_record)
             y_all.append(y_record)
+            y_subtype_all.append(y_subtype_record)
             groups_all.extend([record_ids[i]] * len(X_record))
 
     X_master = np.vstack(X_all) if X_all else np.array([])
     y_master = np.concatenate(y_all) if y_all else np.array([])
+    y_subtype_master = np.concatenate(y_subtype_all) if y_subtype_all else np.array([])
     groups_master = np.array(groups_all)
 
     if len(y_master) == 0:
-        return X_master, y_master, groups_master
+        return X_master, y_master, groups_master, window_size, y_subtype_master
 
     rng = np.random.default_rng(random_seed)
     valid_indices = []
@@ -190,7 +199,10 @@ def load_data(data_dir: str, num_records: int, random_seed: int, stage: str):
             valid_indices.extend(patient_cls_idx)
 
     valid_indices = np.sort(valid_indices)
-    return X_master[valid_indices], y_master[valid_indices], groups_master[valid_indices], window_size
+    return (
+        X_master[valid_indices], y_master[valid_indices], groups_master[valid_indices],
+        window_size, y_subtype_master[valid_indices],
+    )
 
 
 def compute_gan_augmentation_plan(y_train_raw: np.ndarray, encoder: LabelEncoder, exclude_classes=("N", "Q"), max_growth_multiplier: float = 1.05) -> dict:
@@ -438,7 +450,7 @@ def write_multiclass_summary_report(report_path, metrics_df, best_fold):
 def train_binary_stage(args):
     print("STAGE 1: BINARY CLASSIFICATION (Normal vs. Abnormal)")
 
-    X_data, y_labels, groups, window_size = load_data(args.data_dir, args.selected_samples, args.random_seed, stage="binary")
+    X_data, y_labels, groups, window_size, y_subtype = load_data(args.data_dir, args.selected_samples, args.random_seed, stage="binary")
     X_data = X_data.astype(np.float32)
 
     samples_plot(X_data, y_labels, encoder=None, stage="binary", random_state=args.random_seed)
@@ -461,7 +473,14 @@ def train_binary_stage(args):
     sgkf = StratifiedGroupKFold(n_splits=args.Folds, shuffle=True, random_state=args.random_seed)
     fold_number = 0
 
-    for train_idx, test_idx in sgkf.split(X_data, y_encoded, groups):
+    # Stratify by AAMI subtype (N/S/V/F/Q), not the flattened 0/1 label - StratifiedGroupKFold
+    # on the binary label is blind to subtype and can concentrate one subtype almost entirely
+    # into a single fold's validation split purely by chance. Measured effect: one fold whose
+    # validation set held ~60% of all S-class beats (S is morphologically hard to distinguish
+    # from N) needed a decision threshold near 0 to reach 90% sensitivity there, while a fold
+    # dominated by Q (visually distinct paced beats) reached the same sensitivity at a much
+    # higher, more specific threshold - see docs/next_steps_prompt.md.
+    for train_idx, test_idx in sgkf.split(X_data, y_subtype, groups):
         print(f"\n{'=' * 50}\nFold {fold_number}\n{'=' * 50}")
 
         X_train_raw = X_data[train_idx]
@@ -540,7 +559,7 @@ def train_binary_stage(args):
         best_val_acc = history.history["val_accuracy"][best_epoch]
         best_train_acc = history.history["accuracy"][best_epoch]
         best_train_loss = history.history["loss"][best_epoch]
-        best_f1_score = history.history["macro_f1"][best_epoch]
+        best_f1_score = history.history["val_macro_f1"][best_epoch]
 
         y_pred_probs = model.predict(X_test_w, verbose=0).ravel()
         y_pred = (y_pred_probs >= 0.5).astype(np.int32)
@@ -638,7 +657,7 @@ def train_binary_stage(args):
 def train_multiclass_stage(args):
     print("STAGE 2: MULTICLASS CLASSIFICATION")
 
-    X_data, y_labels, groups, window_size = load_data(args.data_dir, args.selected_samples, args.random_seed, stage="multiclass")
+    X_data, y_labels, groups, window_size, _ = load_data(args.data_dir, args.selected_samples, args.random_seed, stage="multiclass")
     X_data = X_data.astype(np.float32)
 
     os.makedirs("outputs", exist_ok=True)
@@ -766,7 +785,7 @@ def train_multiclass_stage(args):
         best_val_acc = history.history["val_accuracy"][best_epoch]
         best_train_acc = history.history["accuracy"][best_epoch]
         best_train_loss = history.history["loss"][best_epoch]
-        best_f1_score = history.history["macro_f1"][best_epoch]
+        best_f1_score = history.history["val_macro_f1"][best_epoch]
 
         y_pred_probs = model.predict(X_test_w, verbose=0)
         y_pred = np.argmax(y_pred_probs, axis=1)

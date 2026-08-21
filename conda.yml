@@ -12,6 +12,7 @@ dependencies:
     - pandas
     - numpy
     - wfdb
+    - neurokit2
     - matplotlib
     - joblib
     - mlflow

@@ -4,6 +4,7 @@ pandas
 numpy
 scipy
 wfdb
+neurokit2
 matplotlib
 joblib
 mlflow
