@@ -3,6 +3,11 @@ import csv
 import argparse
 import numpy as np
 import pandas as pd
+import matplotlib
+if os.environ.get("WGAN_INTERACTIVE_MONITOR") == "1":
+    matplotlib.use("TkAgg")
+else:
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import joblib
 import mlflow
@@ -97,51 +102,129 @@ def dtw_cross_set(real_signals: np.ndarray, synthetic_signals: np.ndarray, max_s
     }
 
 
-class WGANMonitor(tf.keras.callbacks.Callback):
-    def __init__(self, real_samples, num_samples=4, latent_dim=100, save_dir='outputs/wgan_samples', class_name=""):
+class InteractiveWGANMonitor(tf.keras.callbacks.Callback):
+    """Display a live ECG dashboard during WGAN-GP training."""
+
+    def __init__(self, real_samples, latent_dim, every_n_epochs=50,
+                 num_samples=4, class_name="", metric_max_samples=100,
+                 dtw_window=20):
         super().__init__()
-        self.num_samples = min(num_samples, len(real_samples))
+        if every_n_epochs < 1:
+            raise ValueError("every_n_epochs must be at least 1")
+
+        self.every_n_epochs = every_n_epochs
         self.latent_dim = latent_dim
-        self.save_dir = save_dir
         self.class_name = class_name
+        self.metric_max_samples = metric_max_samples
+        self.dtw_window = dtw_window
+        self.start_time = None
+        self.loss_history = {"g_loss": [], "d_loss": []}
+        self.metric_history = []
 
-        # Pick fixed real samples
-        np.random.seed(42)
-        idx = np.random.choice(len(real_samples), self.num_samples, replace=False)
-        self.real_samples = real_samples[idx]
+        rng = np.random.default_rng(42)
+        self.num_samples = min(num_samples, len(real_samples))
+        real_indices = rng.choice(len(real_samples), self.num_samples, replace=False)
+        self.real_samples = real_samples[real_indices]
+        self.fixed_noise = tf.random.normal(shape=(1, latent_dim), seed=42)
 
-        # Build fixed latent vectors
-        self.fixed_latent_vectors = tf.random.normal(shape=(self.num_samples, latent_dim))
+        self.figure, self.axes = plt.subplots(2, 3, figsize=(16, 8), num="WGAN-GP ECG monitor")
+        self.status_text = self.figure.text(0.5, 0.015, "Status: oczekiwanie na start...", ha="center", fontsize=11)
+        plt.ion()
+        self.figure.show()
 
-        os.makedirs(self.save_dir, exist_ok=True)
+    def on_train_begin(self, logs=None):
+        self.start_time = time.perf_counter()
+        self.total_epochs = self.params.get("epochs")
+
+    def _elapsed_seconds(self):
+        return time.perf_counter() - self.start_time if self.start_time else 0.0
+
+    def _update_status(self, epoch):
+        current_epoch = epoch + 1
+        total_epochs = self.total_epochs or current_epoch
+        progress = min(current_epoch / total_epochs, 1.0)
+        bar_width = 30
+        filled = int(bar_width * progress)
+        bar = "#" * filled + "-" * (bar_width - filled)
+        elapsed = self._elapsed_seconds()
+        remaining = elapsed * (1.0 - progress) / progress if progress > 0 else 0.0
+        status = "zakonczony" if current_epoch >= total_epochs else "trening"
+        self.status_text.set_text(
+            f"Epoki: {current_epoch}/{total_epochs} [{bar}] {progress * 100:.1f}% | "
+            f"Czas: {elapsed:.0f} s | Pozostalo: {remaining:.0f} s | Status: {status}"
+        )
+
+    def _update_dashboard(self, epoch, generated_samples, metrics):
+        axes = self.axes.ravel()
+        for axis in axes:
+            axis.clear()
+
+        axes[0].plot(generated_samples[0, :, 0], color="tab:blue")
+        axes[0].set_title("Aktualny synthetic beat (fixed noise)")
+        axes[1].plot(np.mean(self.real_samples[:, :, 0], axis=0), color="tab:green")
+        axes[1].set_title("Sredni real beat")
+        axes[2].plot(np.mean(generated_samples[:, :, 0], axis=0), color="tab:blue")
+        axes[2].set_title("Sredni synthetic beat")
+
+        epochs = np.arange(1, len(self.loss_history["g_loss"]) + 1)
+        axes[3].plot(epochs, self.loss_history["g_loss"], color="tab:red", label="g_loss")
+        axes[3].set_title("Generator loss")
+        axes[3].set_xlabel("Epoka")
+        axes[3].legend()
+        axes[4].plot(epochs, self.loss_history["d_loss"], color="tab:orange", label="d_loss")
+        axes[4].set_title("Critic loss")
+        axes[4].set_xlabel("Epoka")
+        axes[4].legend()
+
+        axes[5].axis("off")
+        axes[5].text(
+            0.02, 0.95,
+            f"Epoka: {epoch + 1}\n"
+            f"Czas treningu: {self._elapsed_seconds():.1f} s\n\n"
+            f"DTW real-real: {metrics['dtw_real_real']:.3f}\n"
+            f"DTW synth-synth: {metrics['dtw_synth_synth']:.3f}\n"
+            f"DTW real-synth: {metrics['dtw_real_synth']:.3f}\n"
+            f"Diversity ratio: {metrics['diversity_ratio']:.3f}",
+            va="top", fontsize=12,
+        )
+        self._update_status(epoch)
+
+        for axis in axes[:5]:
+            axis.grid(True, linestyle="--", alpha=0.5)
+        for axis in axes[:3]:
+            axis.set_ylim([-4, 4])
+        self.figure.suptitle(f"WGAN-GP | klasa {self.class_name} | epoka {epoch + 1}")
+        self.figure.tight_layout(rect=[0, 0.055, 1, 0.95])
+        self.figure.canvas.draw_idle()
+        self.figure.canvas.flush_events()
+        plt.pause(0.001)
 
     def on_epoch_end(self, epoch, logs=None):
-        if epoch == 0 or (epoch + 1) % 10 == 0:
-            generated_signals = self.model.generator(self.fixed_latent_vectors, training=False).numpy()
+        logs = logs or {}
+        self.loss_history["g_loss"].append(float(logs.get("g_loss", np.nan)))
+        self.loss_history["d_loss"].append(float(logs.get("d_loss", np.nan)))
+        if (epoch + 1) % self.every_n_epochs != 0:
+            return
 
-            fig, axes = plt.subplots(2, self.num_samples + 1, figsize=(18, 7))
-            fig.suptitle(f'ECG comparison (Class: {self.class_name}) - Epoch {epoch + 1}', fontsize=14)
+        generated_fixed = self.model.generator(self.fixed_noise, training=False).numpy()
+        metric_noise = tf.random.normal(shape=(self.num_samples, self.latent_dim))
+        generated_samples = self.model.generator(metric_noise, training=False).numpy()
+        real_stats = dtw_within_set(self.real_samples, max_samples=self.metric_max_samples, window=self.dtw_window)
+        synth_stats = dtw_within_set(generated_samples, max_samples=self.metric_max_samples, window=self.dtw_window)
+        cross_stats = dtw_cross_set(self.real_samples, generated_samples, max_samples=self.metric_max_samples, window=self.dtw_window)
+        metrics = {
+            "dtw_real_real": real_stats["mean"],
+            "dtw_synth_synth": synth_stats["mean"],
+            "dtw_real_synth": cross_stats["mean"],
+            "diversity_ratio": synth_stats["mean"] / (real_stats["mean"] + 1e-8),
+        }
+        self.metric_history.append(metrics)
+        self._update_dashboard(epoch, np.repeat(generated_fixed, self.num_samples, axis=0), metrics)
 
-            for i in range(self.num_samples):
-                axes[0, i].plot(self.real_samples[i, :, 0], color='green')
-                axes[0, i].set_title(f"Real {i + 1}")
-                axes[1, i].plot(generated_signals[i, :, 0], color='blue')
-                axes[1, i].set_title(f"Synthetic {i + 1}")
-
-            axes[0, -1].plot(np.mean(self.real_samples[:, :, 0], axis=0), color='green')
-            axes[0, -1].set_title('Average real')
-            axes[1, -1].plot(np.mean(generated_signals[:, :, 0], axis=0), color='blue')
-            axes[1, -1].set_title('Average synthetic')
-
-            for axis in axes.flat:
-                axis.set_ylim([-4, 4])
-                axis.grid(True, linestyle='--', alpha=0.6)
-
-            fig.tight_layout()
-
-            filepath = os.path.join(self.save_dir, f'epoch_{epoch+1:03d}.png')
-            plt.savefig(filepath)
-            plt.close(fig)
+    def on_train_end(self, logs=None):
+        print(f"[GAN] Interactive monitor: operation time: {self._elapsed_seconds():.2f} seconds")
+        self.figure.canvas.draw_idle()
+        self.figure.canvas.flush_events()
 
 
 class MLflowWGANCallback(tf.keras.callbacks.Callback):
@@ -347,6 +430,7 @@ def train_gan_and_generate(
     lr_decay_factor: float = 10.0,
     random_seed: int = 42,
     output_dir: str = "outputs",
+    interactive_monitor: bool = False,
 ) -> np.ndarray:
     """
     Trains a WGAN-GP on real ECG windows of a single AAMI class and returns
@@ -399,12 +483,19 @@ def train_gan_and_generate(
 
     metric_prefix = f"gan_{run_label}_"
     callbacks = [
-        WGANMonitor(num_samples=4, latent_dim=latent_dim, save_dir=class_dir, class_name=target_class_name, real_samples=X_scaled),
         MLflowWGANCallback(metric_prefix=metric_prefix),
         EpochWeightsSaver(filepath=os.path.join(class_dir, "wgan_epoch_{epoch:03d}.weights.h5"), interval=50),
         LearningRateDecayCallback(decay_factor=lr_decay_factor),
         DTWDiversityCallback(real_signals=X_scaled, latent_dim=latent_dim, every_n_epochs=10, metric_prefix=metric_prefix),
     ]
+    if interactive_monitor:
+        callbacks.insert(0, InteractiveWGANMonitor(
+            real_samples=X_scaled,
+            latent_dim=latent_dim,
+            every_n_epochs=5,
+            num_samples=4,
+            class_name=target_class_name,
+        ))
 
     print(f"\n{'='*50}\nTraining WGAN-GP | class={target_class_name} fold={fold}\n{'='*50}")
     operation_start = time.perf_counter()
