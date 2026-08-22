@@ -9,6 +9,7 @@ import mlflow
 import mlflow.tensorflow
 import tensorflow as tf
 import sys
+import time
 
 from itertools import combinations
 from sklearn.model_selection import StratifiedGroupKFold
@@ -116,27 +117,27 @@ class WGANMonitor(tf.keras.callbacks.Callback):
 
     def on_epoch_end(self, epoch, logs=None):
         if epoch == 0 or (epoch + 1) % 10 == 0:
-            # Generate samples
             generated_signals = self.model.generator(self.fixed_latent_vectors, training=False).numpy()
 
-            # Draw a 2 x num_samples grid
-            fig, axes = plt.subplots(2, self.num_samples, figsize=(15, 6))
+            fig, axes = plt.subplots(2, self.num_samples + 1, figsize=(18, 7))
             fig.suptitle(f'ECG comparison (Class: {self.class_name}) - Epoch {epoch + 1}', fontsize=14)
 
             for i in range(self.num_samples):
-                # Top row: real ECG
                 axes[0, i].plot(self.real_samples[i, :, 0], color='green')
-                axes[0, i].set_title(f"Real {i+1}")
-                axes[0, i].set_ylim([-4, 4])
-                axes[0, i].grid(True, linestyle='--', alpha=0.6)
-
-                # Bottom row: generated ECG
+                axes[0, i].set_title(f"Real {i + 1}")
                 axes[1, i].plot(generated_signals[i, :, 0], color='blue')
-                axes[1, i].set_title(f"Generated {i+1}")
-                axes[1, i].set_ylim([-4, 4])
-                axes[1, i].grid(True, linestyle='--', alpha=0.6)
+                axes[1, i].set_title(f"Synthetic {i + 1}")
 
-            plt.tight_layout()
+            axes[0, -1].plot(np.mean(self.real_samples[:, :, 0], axis=0), color='green')
+            axes[0, -1].set_title('Average real')
+            axes[1, -1].plot(np.mean(generated_signals[:, :, 0], axis=0), color='blue')
+            axes[1, -1].set_title('Average synthetic')
+
+            for axis in axes.flat:
+                axis.set_ylim([-4, 4])
+                axis.grid(True, linestyle='--', alpha=0.6)
+
+            fig.tight_layout()
 
             filepath = os.path.join(self.save_dir, f'epoch_{epoch+1:03d}.png')
             plt.savefig(filepath)
@@ -173,6 +174,29 @@ class EpochWeightsSaver(tf.keras.callbacks.Callback):
             self.model.critic.save_weights(crit_path)
 
             print(f"\n[Checkpoint] Saved (Generator, Critic) weights for epoch {epoch + 1}")
+
+
+class LearningRateDecayCallback(tf.keras.callbacks.Callback):
+    def __init__(self, decay_epoch=5000, decay_factor=10.0):
+        super().__init__()
+        self.decay_epoch = decay_epoch
+        self.decay_factor = decay_factor
+        self.has_decayed = False
+
+    def on_epoch_end(self, epoch, logs=None):
+        if self.has_decayed or epoch + 1 != self.decay_epoch:
+            return
+
+        generator_lr = self.model.g_optimizer.learning_rate / self.decay_factor
+        critic_lr = self.model.d_optimizer.learning_rate / self.decay_factor
+        self.model.g_optimizer.learning_rate.assign(generator_lr)
+        self.model.d_optimizer.learning_rate.assign(critic_lr)
+        self.has_decayed = True
+
+        print(
+            f"\n[Learning rate] Reduced by {self.decay_factor:g}x after epoch {self.decay_epoch}: "
+            f"generator={float(generator_lr):.3e}, critic={float(critic_lr):.3e}"
+        )
 
 
 class DTWDiversityCallback(tf.keras.callbacks.Callback):
@@ -320,6 +344,7 @@ def train_gan_and_generate(
     batch_size: int = 32,
     critic_lr_multiplier: float = 3.0,
     start_learning_rate: float = 5e-5,
+    lr_decay_factor: float = 10.0,
     random_seed: int = 42,
     output_dir: str = "outputs",
 ) -> np.ndarray:
@@ -339,6 +364,7 @@ def train_gan_and_generate(
         - n_samples_to_generate: how many synthetic windows to produce
         - window_size, target_class_name, fold: context used for outputs/metrics naming
         - epochs, d_steps, gp_weight, latent_dim, batch_size, critic_lr_multiplier, start_learning_rate: GAN hyperparameters
+        - lr_decay_factor: divide both learning rates by this factor after epoch 5000 (5 or 10)
         - random_seed: shuffling/reproducibility seed
         - output_dir: base directory for sample plots and loss curves
     Returns:
@@ -376,10 +402,12 @@ def train_gan_and_generate(
         WGANMonitor(num_samples=4, latent_dim=latent_dim, save_dir=class_dir, class_name=target_class_name, real_samples=X_scaled),
         MLflowWGANCallback(metric_prefix=metric_prefix),
         EpochWeightsSaver(filepath=os.path.join(class_dir, "wgan_epoch_{epoch:03d}.weights.h5"), interval=50),
+        LearningRateDecayCallback(decay_factor=lr_decay_factor),
         DTWDiversityCallback(real_signals=X_scaled, latent_dim=latent_dim, every_n_epochs=10, metric_prefix=metric_prefix),
     ]
 
     print(f"\n{'='*50}\nTraining WGAN-GP | class={target_class_name} fold={fold}\n{'='*50}")
+    operation_start = time.perf_counter()
     history = wgan.fit(train_dataset, epochs=epochs, callbacks=callbacks, verbose=1)
     plot_wgan_losses(history, run_label, output_dir=output_dir)
 
@@ -388,6 +416,7 @@ def train_gan_and_generate(
     X_synthetic = scaler.inverse_transform(X_synthetic_scaled.reshape(-1, 1)).reshape(-1, window_size, 1).astype(np.float32)
 
     print(f"[GAN] Generated {len(X_synthetic)} synthetic windows for class {target_class_name} (fold {fold})")
+    print(f"[GAN] Operation time: {time.perf_counter() - operation_start:.2f} seconds")
     return X_synthetic
 
 
@@ -406,6 +435,8 @@ def build_parser():
     parser.add_argument("--critic-lr-multiplier", type=float, default=3.0, help="Critic learning rate as a multiple of --start-learning-rate")
     parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--start-learning-rate", type=float, default=5e-5, help="Generator learning rate for WGAN-GP (default 0.00005)")
+    parser.add_argument("--lr-decay-factor", type=float, choices=[5.0, 10.0], default=10.0,
+                        help="Divide both learning rates by this factor after epoch 5000 (default: 10)")
     return parser
 
 
@@ -423,6 +454,8 @@ def main():
         "batch_size": args.batch_size,
         "latent_dim": args.latent_dim,
         "learning_rate": args.start_learning_rate,
+        "lr_decay_epoch": 5000,
+        "lr_decay_factor": args.lr_decay_factor,
         "critic_lr_multiplier": args.critic_lr_multiplier,
         "model_type": "WGAN-GP_1D"
     })
@@ -486,6 +519,7 @@ def main():
         batch_size=args.batch_size,
         critic_lr_multiplier=args.critic_lr_multiplier,
         start_learning_rate=args.start_learning_rate,
+        lr_decay_factor=args.lr_decay_factor,
         random_seed=args.random_seed,
     )
 

@@ -68,6 +68,7 @@ def build_parser():
     parser.add_argument("--gan-batch-size", type=int, default=32, help="Batch size for WGAN-GP training")
     parser.add_argument("--gan-critic-lr-multiplier", type=float, default=3.0, help="Critic LR as a multiple of --gan-start-learning-rate")
     parser.add_argument("--gan-start-learning-rate", type=float, default=5e-5, help="Generator learning rate for WGAN-GP")
+    parser.add_argument("--gan-max-growth", type=float, default=1.05, help="Cap on how much a class may grow from synthetic samples, as a multiple of its OWN current count (1.05 = +5%%). Note this scales with the class's own size, so the rarest classes get the fewest synthetic samples - see compute_gan_augmentation_plan's docstring")
     return parser
 
 
@@ -273,7 +274,7 @@ def augment_fold_with_gan(X_train_raw, y_train_raw, groups_train, encoder, windo
         - augmentation_report: list of per-class dicts (class, count_before, n_patients_used,
           n_generated, count_after), empty if no class needed augmentation
     """
-    plan = compute_gan_augmentation_plan(y_train_raw, encoder)
+    plan = compute_gan_augmentation_plan(y_train_raw, encoder, max_growth_multiplier=args.gan_max_growth)
     if not plan:
         return X_train_raw, y_train_raw, []
 
@@ -641,8 +642,11 @@ def train_binary_stage(args):
     mlflow.log_metric("cv_binary_mean_f1_score", mean_f1_score)
     mlflow.log_metric("best_binary_fold_number", best_fold)
 
-    shutil.copy(f"outputs/best_model_fold_{best_fold}_binary.keras", "outputs/best_overall_binary_model.keras")
-    shutil.copy(f"outputs/scaler_fold_{best_fold}_binary.pkl", "outputs/best_overall_binary_scaler.pkl")
+    # copyfile, not copy: copy() also calls copymode(), whose chmod fails with EPERM when the
+    # working directory is a Windows drive mounted in WSL2 (DrvFs doesn't support chmod unless
+    # the mount has metadata enabled). Only the file contents matter for these artifacts.
+    shutil.copyfile(f"outputs/best_model_fold_{best_fold}_binary.keras", "outputs/best_overall_binary_model.keras")
+    shutil.copyfile(f"outputs/scaler_fold_{best_fold}_binary.pkl", "outputs/best_overall_binary_scaler.pkl")
 
     model.save("outputs/ecg_binary_model.keras")
     print("Model saved successfully to outputs/ecg_binary_model.keras")
@@ -893,8 +897,9 @@ def train_multiclass_stage(args):
     mlflow.log_metric("cv_mean_f1_score", mean_f1_score)
     mlflow.log_metric("best_fold_number", best_fold)
 
-    shutil.copy(f"outputs/best_model_fold_{best_fold}.keras", "outputs/best_overall_multiclass_model.keras")
-    shutil.copy(f"outputs/scaler_fold_{best_fold}.pkl", "outputs/best_overall_scaler.pkl")
+    # copyfile, not copy - see the note in train_binary_stage (chmod fails on WSL2's DrvFs mounts).
+    shutil.copyfile(f"outputs/best_model_fold_{best_fold}.keras", "outputs/best_overall_multiclass_model.keras")
+    shutil.copyfile(f"outputs/scaler_fold_{best_fold}.pkl", "outputs/best_overall_scaler.pkl")
 
     model.save("outputs/ecg_multiclass_model.keras")
     print("Model saved successfully to outputs/ecg_multiclass_model.keras")
@@ -914,9 +919,28 @@ def run_selected_task(args):
         train_multiclass_stage(args)
 
 
+def configure_gpu_memory_growth():
+    """
+    Lets TensorFlow grow GPU memory on demand instead of preallocating nearly all VRAM on first
+    use. Needed for local training on a 4GB laptop GPU, where the default behaviour collides with
+    whatever the display driver already holds. No-op when no GPU is visible (e.g. the Azure
+    cpu-cluster), so this is safe in both environments.
+    """
+    gpus = tf.config.list_physical_devices("GPU")
+    for gpu in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as exc:
+            # Only raised if TF already initialized the device - not worth failing the run over.
+            print(f"Warning: could not enable memory growth on {gpu.name}: {exc}")
+    print(f"TensorFlow {tf.__version__} | GPUs visible: {[gpu.name for gpu in gpus] or 'none (CPU)'}")
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    configure_gpu_memory_growth()
 
     mlflow.log_params({
         "epochs": args.epochs,
