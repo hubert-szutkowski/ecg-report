@@ -227,6 +227,59 @@ class InteractiveWGANMonitor(tf.keras.callbacks.Callback):
         self.figure.canvas.flush_events()
 
 
+class SavedSamplesCallback(tf.keras.callbacks.Callback):
+    """Save four real and four generated beats as separate PNG files."""
+
+    def __init__(self, real_samples, latent_dim, output_dir, every_n_epochs=100,
+                 num_samples=4, class_name=""):
+        super().__init__()
+        if every_n_epochs < 1:
+            raise ValueError("every_n_epochs must be at least 1")
+
+        self.every_n_epochs = every_n_epochs
+        self.latent_dim = latent_dim
+        self.output_dir = output_dir
+        self.class_name = class_name
+        self.num_samples = min(num_samples, len(real_samples))
+        rng = np.random.default_rng(42)
+        self.real_samples = real_samples[rng.choice(len(real_samples), self.num_samples, replace=False)]
+        self.fixed_noise = tf.random.normal(shape=(self.num_samples, latent_dim), seed=42)
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def _save_samples(self, samples, path, title, color):
+        figure, axes = plt.subplots(self.num_samples, 1, figsize=(10, 2.2 * self.num_samples), squeeze=False)
+        for axis, sample in zip(axes.ravel(), samples):
+            axis.plot(sample[:, 0], color=color)
+            axis.set_xlabel("Sample index in ECG beat")
+            axis.set_ylabel("Amplitude")
+            axis.grid(True, alpha=0.3)
+        figure.suptitle(title)
+        figure.tight_layout()
+        figure.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(figure)
+
+    def on_epoch_end(self, epoch, logs=None):
+        current_epoch = epoch + 1
+        if current_epoch % self.every_n_epochs != 0:
+            return
+
+        generated_samples = self.model.generator(self.fixed_noise, training=False).numpy()
+        prefix = f"{self.class_name}_epoch_{current_epoch:04d}"
+        self._save_samples(
+            self.real_samples,
+            os.path.join(self.output_dir, f"real_samples_{prefix}.png"),
+            f"Real ECG beats | class {self.class_name} | epoch {current_epoch}",
+            "tab:green",
+        )
+        self._save_samples(
+            generated_samples,
+            os.path.join(self.output_dir, f"synthetic_samples_{prefix}.png"),
+            f"Synthetic ECG beats | class {self.class_name} | epoch {current_epoch}",
+            "tab:blue",
+        )
+        print(f"[Samples] Saved 4 real and 4 synthetic beats for epoch {current_epoch}")
+
+
 class MLflowWGANCallback(tf.keras.callbacks.Callback):
     """Log WGAN metrics to MLflow, namespaced so parallel per-class/per-fold runs don't collide."""
     def __init__(self, metric_prefix=""):
@@ -484,6 +537,14 @@ def train_gan_and_generate(
     metric_prefix = f"gan_{run_label}_"
     callbacks = [
         MLflowWGANCallback(metric_prefix=metric_prefix),
+        SavedSamplesCallback(
+            real_samples=X_scaled,
+            latent_dim=latent_dim,
+            output_dir=class_dir,
+            every_n_epochs=100,
+            num_samples=4,
+            class_name=target_class_name,
+        ),
         EpochWeightsSaver(filepath=os.path.join(class_dir, "wgan_epoch_{epoch:03d}.weights.h5"), interval=50),
         LearningRateDecayCallback(decay_factor=lr_decay_factor),
         DTWDiversityCallback(real_signals=X_scaled, latent_dim=latent_dim, every_n_epochs=10, metric_prefix=metric_prefix),
