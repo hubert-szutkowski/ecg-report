@@ -68,6 +68,8 @@ def build_parser():
     parser.add_argument("--gan-batch-size", type=int, default=32, help="Batch size for WGAN-GP training")
     parser.add_argument("--gan-critic-lr-multiplier", type=float, default=3.0, help="Critic LR as a multiple of --gan-start-learning-rate")
     parser.add_argument("--gan-start-learning-rate", type=float, default=5e-5, help="Generator learning rate for WGAN-GP")
+    parser.add_argument("--class-weight", type=str, default="none", choices=["none", "balanced"],
+                        help="Per-class loss weighting for the MULTICLASS stage. Default 'none' preserves the behaviour of every run made before this option existed, so past results stay comparable; 'balanced' uses sklearn's n/(k*count_c). The binary stage is unaffected - its BinaryFocalCrossentropy(alpha=0.25) already weights the anomaly class")
     parser.add_argument("--gan-max-growth", type=float, default=1.05, help="Cap on how much a class may grow from synthetic samples, as a multiple of its OWN current count (1.05 = +5%%). Note this scales with the class's own size, so the rarest classes get the fewest synthetic samples - see compute_gan_augmentation_plan's docstring")
     return parser
 
@@ -250,6 +252,44 @@ def compute_gan_augmentation_plan(y_train_raw: np.ndarray, encoder: LabelEncoder
             plan[class_name] = n_to_generate
 
     return plan
+
+
+def compute_multiclass_class_weights(y_train_raw: np.ndarray, num_classes: int, encoder: LabelEncoder, mode: str):
+    """
+    Per-class loss weights for the multiclass stage, or None to leave the loss unweighted.
+
+    Why this exists: the multiclass loss is CategoricalFocalCrossentropy with a SCALAR alpha,
+    which applies identically to every class and therefore does nothing about class imbalance.
+    Even after GAN augmentation at a 2x growth cap, class F is only ~1.3% of a fold's training
+    windows against V/Q at 34-43x its size - measured, F scored 0.00 F1 in 4 of 5 folds, so
+    adding synthetic beats alone did not make it learnable. Weighting the loss attacks that
+    directly, where more data at 1% of the set cannot.
+
+    Computed AFTER augmentation, so the weights reflect the distribution the model actually
+    trains on rather than the pre-augmentation one.
+
+    Parameters:
+        - y_train_raw: encoded labels for this fold's (possibly augmented) training partition
+        - num_classes: total number of classes, so absent classes still get an entry
+        - encoder: LabelEncoder, used only to name classes in the printed summary
+        - mode: "none" leaves the loss unweighted (the historical behaviour, and what every run
+          before this option existed used); "balanced" uses sklearn's n/(k*count_c)
+    Returns:
+        - dict {class_index: weight} for Keras's class_weight, or None when mode == "none"
+    """
+    if mode == "none":
+        return None
+
+    present_classes = np.unique(y_train_raw)
+    weights = compute_class_weight("balanced", classes=present_classes, y=y_train_raw)
+    # Classes absent from this fold get weight 1.0 - they contribute no samples, so the value is
+    # never used, but Keras wants a complete mapping.
+    class_weights = {int(class_index): 1.0 for class_index in range(num_classes)}
+    class_weights.update({int(class_index): float(weight) for class_index, weight in zip(present_classes, weights)})
+
+    summary = ", ".join(f"{encoder.classes_[idx]}={class_weights[idx]:.2f}" for idx in range(num_classes))
+    print(f"Class weights ({mode}): {summary}")
+    return class_weights
 
 
 def augment_fold_with_gan(X_train_raw, y_train_raw, groups_train, encoder, window_size, fold_number, args):
@@ -719,6 +759,7 @@ def train_multiclass_stage(args):
             )
 
         train_counts_after = _class_counts(y_train_raw)
+        fold_class_weights = compute_multiclass_class_weights(y_train_raw, num_classes, encoder, args.class_weight)
 
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train_raw)
@@ -781,6 +822,7 @@ def train_multiclass_stage(args):
             epochs=args.epochs,
             validation_data=val_dataset,
             callbacks=callbacks,
+            class_weight=fold_class_weights,
             verbose=1,
         )
 
@@ -949,6 +991,9 @@ def main():
         "batch_size": args.batch_size,
         "Folds": args.Folds,
         "task": args.task,
+        "class_weight": args.class_weight,
+        "skip_gan_augmentation": args.skip_gan_augmentation,
+        "gan_max_growth": args.gan_max_growth,
         "model_type": "Multistage Inception-Conformer",
     })
 

@@ -9,6 +9,8 @@ if os.environ.get("WGAN_INTERACTIVE_MONITOR") == "1":
 else:
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 import joblib
 import mlflow
 import mlflow.tensorflow
@@ -41,7 +43,7 @@ def _prepare(signals: np.ndarray) -> np.ndarray:
     return np.asarray([s.squeeze().astype(np.float64) for s in signals])
 
 
-def dtw_within_set(signals: np.ndarray, max_samples: int = 100, window: int | None = 20) -> dict:
+def dtw_within_set(signals: np.ndarray, max_samples: int = 100, window: int | None = 20, random_state: int = 42) -> dict:
     """
     Mean/median/std of pairwise DTW within one set (real-real or synthetic-synthetic).
 
@@ -49,12 +51,20 @@ def dtw_within_set(signals: np.ndarray, max_samples: int = 100, window: int | No
         - signals: np.ndarray of shape (n_samples, n_timesteps, 1)
         - max_samples: int, maximum number of samples to consider for pairwise DTW
         - window: int or None, the Sakoe-Chiba window size for DTW
+        - random_state: seed for the subsample drawn when len(signals) > max_samples. Seeded by
+          default because this function's output is compared ACROSS runs (diversity_ratio, and
+          the dtw_diversity_ratio metric a HyperDrive sweep selects on). With an unseeded draw,
+          the same unchanged real data gave 5.87 and 7.67 on two runs of class S - a 31% swing
+          that is pure subsampling noise, large enough to swamp real differences between runs.
+          Sets smaller than max_samples are unaffected either way (class F, 72 windows, was
+          already reproducible to 15 decimal places).
     Returns:
         - dict with keys: mean, median, std, n_pairs
     """
     signals = _prepare(signals)
     if len(signals) > max_samples:
-        idx = np.random.choice(len(signals), max_samples, replace=False)
+        rng = np.random.default_rng(random_state)
+        idx = rng.choice(len(signals), max_samples, replace=False)
         signals = signals[idx]
 
     dist_matrix = dtw.distance_matrix_fast(signals, window=window, parallel=True)
@@ -68,7 +78,7 @@ def dtw_within_set(signals: np.ndarray, max_samples: int = 100, window: int | No
     }
 
 
-def dtw_cross_set(real_signals: np.ndarray, synthetic_signals: np.ndarray, max_samples: int = 100, window: int | None = 20) -> dict:
+def dtw_cross_set(real_signals: np.ndarray, synthetic_signals: np.ndarray, max_samples: int = 100, window: int | None = 20, random_state: int = 42) -> dict:
     """
     Mean/median/std of pairwise DTW between two different sets (real vs synthetic).
 
@@ -77,16 +87,19 @@ def dtw_cross_set(real_signals: np.ndarray, synthetic_signals: np.ndarray, max_s
         - synthetic_signals: np.ndarray of shape (n_synthetic_samples, n_timesteps, 1)
         - max_samples: int, maximum number of samples to consider for pairwise DTW
         - window: int or None, the Sakoe-Chiba window size for DTW
+        - random_state: seed for the subsamples drawn when a set exceeds max_samples - see
+          dtw_within_set's docstring for why this must not be left unseeded
     Returns:
         - dict with keys: mean, median, std, n_pairs
     """
     real = _prepare(real_signals)
     synth = _prepare(synthetic_signals)
 
+    rng = np.random.default_rng(random_state)
     if len(real) > max_samples:
-        real = real[np.random.choice(len(real), max_samples, replace=False)]
+        real = real[rng.choice(len(real), max_samples, replace=False)]
     if len(synth) > max_samples:
-        synth = synth[np.random.choice(len(synth), max_samples, replace=False)]
+        synth = synth[rng.choice(len(synth), max_samples, replace=False)]
 
     combined = np.vstack([real, synth])
     n_real = len(real)
@@ -154,12 +167,13 @@ class InteractiveWGANMonitor(tf.keras.callbacks.Callback):
             f"Czas: {elapsed:.0f} s | Pozostalo: {remaining:.0f} s | Status: {status}"
         )
 
-    def _update_dashboard(self, epoch, generated_samples, metrics):
+    def _update_dashboard(self, epoch, generated_samples, metrics, generated_fixed=None):
         axes = self.axes.ravel()
         for axis in axes:
             axis.clear()
 
-        axes[0].plot(generated_samples[0, :, 0], color="tab:blue")
+        fixed_sample = generated_samples[0] if generated_fixed is None else generated_fixed[0]
+        axes[0].plot(fixed_sample[:, 0], color="tab:blue")
         axes[0].set_title("Aktualny synthetic beat (fixed noise)")
         axes[1].plot(np.mean(self.real_samples[:, :, 0], axis=0), color="tab:green")
         axes[1].set_title("Sredni real beat")
@@ -219,7 +233,7 @@ class InteractiveWGANMonitor(tf.keras.callbacks.Callback):
             "diversity_ratio": synth_stats["mean"] / (real_stats["mean"] + 1e-8),
         }
         self.metric_history.append(metrics)
-        self._update_dashboard(epoch, np.repeat(generated_fixed, self.num_samples, axis=0), metrics)
+        self._update_dashboard(epoch, generated_samples, metrics, generated_fixed=generated_fixed)
 
     def on_train_end(self, logs=None):
         print(f"[GAN] Interactive monitor: operation time: {self._elapsed_seconds():.2f} seconds")
@@ -228,7 +242,7 @@ class InteractiveWGANMonitor(tf.keras.callbacks.Callback):
 
 
 class SavedSamplesCallback(tf.keras.callbacks.Callback):
-    """Save four real and four generated beats as separate PNG files."""
+    """Save four fixed real beats once and four generated beats every N epochs."""
 
     def __init__(self, real_samples, latent_dim, output_dir, every_n_epochs=100,
                  num_samples=4, class_name=""):
@@ -247,7 +261,9 @@ class SavedSamplesCallback(tf.keras.callbacks.Callback):
         os.makedirs(self.output_dir, exist_ok=True)
 
     def _save_samples(self, samples, path, title, color):
-        figure, axes = plt.subplots(self.num_samples, 1, figsize=(10, 2.2 * self.num_samples), squeeze=False)
+        figure = Figure(figsize=(10, 2.2 * self.num_samples))
+        FigureCanvasAgg(figure)
+        axes = figure.subplots(self.num_samples, 1, squeeze=False)
         for axis, sample in zip(axes.ravel(), samples):
             axis.plot(sample[:, 0], color=color)
             axis.set_xlabel("Sample index in ECG beat")
@@ -256,7 +272,16 @@ class SavedSamplesCallback(tf.keras.callbacks.Callback):
         figure.suptitle(title)
         figure.tight_layout()
         figure.savefig(path, dpi=150, bbox_inches="tight")
-        plt.close(figure)
+
+    def on_train_begin(self, logs=None):
+        path = os.path.join(self.output_dir, f"real_samples_{self.class_name}.png")
+        self._save_samples(
+            self.real_samples,
+            path,
+            f"Real ECG beats | class {self.class_name}",
+            "tab:green",
+        )
+        print(f"[Samples] Saved 4 real beats to {path}")
 
     def on_epoch_end(self, epoch, logs=None):
         current_epoch = epoch + 1
@@ -266,18 +291,12 @@ class SavedSamplesCallback(tf.keras.callbacks.Callback):
         generated_samples = self.model.generator(self.fixed_noise, training=False).numpy()
         prefix = f"{self.class_name}_epoch_{current_epoch:04d}"
         self._save_samples(
-            self.real_samples,
-            os.path.join(self.output_dir, f"real_samples_{prefix}.png"),
-            f"Real ECG beats | class {self.class_name} | epoch {current_epoch}",
-            "tab:green",
-        )
-        self._save_samples(
             generated_samples,
             os.path.join(self.output_dir, f"synthetic_samples_{prefix}.png"),
             f"Synthetic ECG beats | class {self.class_name} | epoch {current_epoch}",
             "tab:blue",
         )
-        print(f"[Samples] Saved 4 real and 4 synthetic beats for epoch {current_epoch}")
+        print(f"[Samples] Saved 4 synthetic beats for epoch {current_epoch}")
 
 
 class MLflowWGANCallback(tf.keras.callbacks.Callback):
