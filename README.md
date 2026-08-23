@@ -10,7 +10,9 @@ Rather than focusing solely on model performance, the project emphasizes reprodu
 
 The system analyzes ECG recordings from the MIT-BIH Arrhythmia Database and serves predictions through a Streamlit application connected to a containerized inference API.
 
-> **Evaluation snapshot: 2026-08-21.** All numbers below come from a real evaluation job run against the live cascade (R-peak detection → binary → multiclass) on held-out MIT-BIH patients — not training-time metrics, and reported with 95% bootstrap confidence intervals (resampled by patient, not by beat) rather than bare point estimates. The R-peak detector was switched from a custom Pan-Tompkins implementation to `neurokit2` in this snapshot (see [R-Peak Detector Choice](#r-peak-detector-choice)); this is the single biggest driver of the numbers below vs. earlier snapshots. Re-running the evaluation pipeline against a newer training job will produce different numbers; this README reflects the most recent run only.
+> **Evaluation snapshot: 2026-08-21.** All numbers below come from a real evaluation job run against the live cascade (R-peak detection → binary → multiclass) on held-out MIT-BIH patients — not training-time metrics, and reported with 95% bootstrap confidence intervals (resampled by patient, not by beat) rather than bare point estimates. The R-peak detector was switched from a custom Pan-Tompkins implementation to `neurokit2` in this snapshot (see [R-Peak Detector Choice](#r-peak-detector-choice)); this is the single biggest driver of the numbers below vs. earlier snapshots.
+>
+> **This snapshot predates the exclusion of AAMI class Q.** That change is decided and documented in [AAMI class scope](#aami-class-scope-why-q-paced-beats-are-excluded) but not yet reflected in any measurement here — the numbers are kept so the before/after is visible rather than silently overwritten.
 
 ---
 
@@ -34,7 +36,7 @@ The main goals of the project are:
 ## Machine Learning
 
 * Binary ECG classification (Normal vs. anomaly)
-* Multiclass ECG classification (AAMI classes S/V/F/Q)
+* Multiclass ECG classification (AAMI classes S/V/F — see [AAMI class scope](#aami-class-scope-why-q-paced-beats-are-excluded))
 * Deep Learning models built with TensorFlow/Keras (Inception-Conformer architecture)
 * Custom Pan-Tompkins R-peak detector, shared between the inference service and the evaluation pipeline
 * Cross-validation-based evaluation (patient-level `StratifiedGroupKFold`)
@@ -78,6 +80,30 @@ Dataset characteristics:
 
 Because the dataset already contains clean ECG recordings, no advanced signal denoising or signal processing pipeline was required. The project focuses primarily on machine learning, model evaluation, deployment, and MLOps engineering.
 
+## AAMI class scope: why Q (paced) beats are excluded
+
+The AAMI standard defines five beat classes — N, S, V, F and Q — and this project originally targeted all five. **Class Q is now excluded from both training stages.** All patients are kept; only their Q-annotated beats are dropped, so the classifier still accepts recordings from any patient and simply does not attempt to assign those beats an arrhythmia label.
+
+What class Q actually contains in MIT-BIH, counted across the whole database:
+
+| Annotation symbol | Meaning | Count | Share of class Q |
+| --- | --- | ---: | ---: |
+| `/` | Paced beat | 9,056 | 89.4% |
+| `f` | Fusion of paced and normal beat | 1,038 | 10.2% |
+| `Q` | Genuinely unclassifiable | 33 | 0.3% |
+
+So "class Q" is, in practice, **pacemaker rhythm** — not an arrhythmia. It says something about the device implanted in the patient, not about the pathology the system is meant to detect. Three measured findings drove the decision:
+
+* **It was never a 5-fold problem.** 99.8% of Q beats come from just four recordings (102, 104, 107, 217 — the paced records). Every CV fold's Q validation set turned out to be ~100% one patient, making Q evaluation a 4-patient leave-one-out disguised as 5-fold CV, with one fold left holding just 2 Q windows.
+* **It failed exactly as that structure predicts.** Folds validating on patients 102/104/107 reached Q F1 of 1.00 / 0.85 / 0.64; the fold validating on patient 217 collapsed to 0.03, assigning 1,692 of its 1,811 true Q beats to class V. The model was learning one pacemaker's morphology, not a general concept.
+* **It dominated the fold-to-fold variance** that made every other experiment in this project unmeasurable — GAN augmentation and class weighting both produced effects far smaller than the noise Q introduced.
+
+Mapping Q to Normal instead of dropping it was considered and rejected: paced beats have a wide QRS morphologically close to class V, so labelling them Normal would push the same confusion down into Stage 1, where errors are unrecoverable. Excluding the four paced records entirely (the AAMI EC57 recommendation) was also considered, but dropping only the Q beats keeps every patient in the dataset, which better matches how the deployed system is meant to behave.
+
+> Note that beats excluded from the label set are still detected by Pan-Tompkins at inference time — the system does not refuse them, it simply has no arrhythmia class for them. The cascade evaluation excludes them from ground truth, consistent with AAMI practice of excluding paced beats from performance assessment.
+
+**The evaluation numbers below were measured before this change, with Q included, and will be replaced once the first post-change training and evaluation runs complete.** They are kept for now so the effect of the change is visible rather than silently overwritten.
+
 ---
 
 # System Architecture
@@ -94,7 +120,8 @@ Because the dataset already contains clean ECG recordings, no advanced signal de
                         │
               anomaly?  ▼  (only anomalies proceed)
              Stage 2: Multiclass Classifier
-                  (AAMI: S / V / F / Q)
+                (AAMI: S / V / F — Q excluded,
+                 see "AAMI class scope" above)
                         │
                         ▼
                 Cross-Validated Training
@@ -232,7 +259,7 @@ These numbers are measured on held-out annotated windows directly, independent o
 
 **Recalibrating the decision threshold away from 0.5 was tried and rejected — twice, on two independent training runs.** Two approaches were tested each time: (1) picking a threshold that hits 90% Stage 1 sensitivity in isolation, and (2) sweeping candidate thresholds through the *full* cascade and ranking by the resulting cascade macro F1. Both were measured against the real cascade output, not just Stage 1 metrics — approach (1) reliably *hurts* cascade macro F1 (0.3444 → 0.2744 in the current snapshot) by flooding Stage 2 with false positives from the resulting collapse in specificity; approach (2)'s best candidate (threshold 0.7 this time, 0.3 or 0.5 in earlier snapshots — the "winner" itself isn't stable run to run) beat the 0.5 default by less than its own bootstrap confidence interval both times, i.e. within noise. The default threshold of 0.5 stays.
 
-## Stage 2 — Multiclass (AAMI: S / V / F / Q)
+## Stage 2 — Multiclass (AAMI: S / V / F / Q — pre-exclusion snapshot)
 
 Aggregate classification report across all 5 folds (window-level, not the cascade — see above for the end-to-end number):
 
@@ -320,19 +347,34 @@ The ~88x batching speedup quantifies the payoff of refactoring `run_stream` from
 
 ## WGAN-GP Case Study
 
-WGAN-GP (Conv1DTranspose generator/critic, `d_steps=3`, gradient penalty) is used to top up rare AAMI classes (S, F, sometimes V) during multiclass training, capped at +5% growth per class per fold to avoid overwhelming real data with synthetic samples.
+WGAN-GP (Conv1DTranspose generator/critic, gradient penalty) tops up rare AAMI classes during multiclass training. The first verdict on it was "inconclusive"; that turned out to be an artefact of the experiment, not a property of the technique, and re-running it properly produced a clear negative result.
 
-A matching pair of training runs — one with GAN augmentation, one with `--skip-gan-augmentation` — were evaluated fold-by-fold:
+### The generator itself is good
 
-| Fold | Val Acc (GAN) | Val Acc (no-GAN) | Difference |
-| --- | --- | --- | --- |
-| 0 | 0.4388 | 0.4889 | -0.0500 |
-| 1 | 0.9760 | 0.9736 | +0.0023 |
-| 2 | 0.2166 | 0.3199 | -0.1033 |
-| 3 | 0.8711 | 0.7967 | +0.0744 |
-| 4 | 0.9739 | 0.9501 | +0.0238 |
+Before asking whether augmentation helps downstream, the generator was evaluated directly — a fast local harness trains one WGAN-GP per class/fold and scores the synthetic beats against the real ones (`Azure/local-run/run_gan_experiment_local.py`):
 
-**Verdict: inconclusive.** Mean Val Acc difference across folds is -0.0106, well within the ±0.347 inter-fold standard deviation — the GAN's effect, whatever it is, is currently smaller than the noise already present from patient-level fold variance. This is a real, measured result, not a placeholder: at the current augmentation strength and dataset size, WGAN-GP augmentation has not been shown to move the needle.
+| Metric | Class F (10k epochs) | Class S (10k epochs) | Reading |
+| --- | ---: | ---: | --- |
+| Mean-beat Pearson r | 0.9982 | 0.9980 | near-identical average morphology |
+| Mean-beat MAE | 0.0265 | 0.0159 | ~0.5% of signal range |
+| Mann-Whitney p (per-beat RMS) | 0.764 | 0.150 | no detectable RMS difference |
+| RBF MMD | 0.0080 | 0.0049 | distributions closely matched |
+
+FFT magnitude matches across the whole band (no high-frequency artefacts), PCA shows synthetic beats covering the real distribution with no clustering, and real-to-synthetic DTW distance ≈ real-to-real distance, which rules out memorisation of the training beats.
+
+### But the augmentation does not help the classifier
+
+The original "+5% growth per class" cap was, on inspection, arithmetically a no-op: the cap scales with the class's *own* size, so class F received **3–4 synthetic windows per fold**. Raised to +100% (≈600 synthetic windows per fold, a ~20× increase) and compared against a `--skip-gan-augmentation` run on **identical fold splits**:
+
+| Metric | With GAN | Without GAN |
+| --- | ---: | ---: |
+| Mean Val Accuracy | 0.6831 | **0.7721** |
+| Mean Val AUC | 0.8587 | **0.8776** |
+| Mean F1 | 0.4086 | **0.4566** |
+
+Worse on every aggregate metric and in 4 of 5 folds individually. Class F stayed at 0.00 F1 in 4 of 5 folds despite having twice the data.
+
+**Verdict: at this dataset size, WGAN-GP augmentation does not improve the downstream classifier**, even with a generator that passes every distributional and morphological check thrown at it and an augmentation dose 20× larger than originally used. The bottleneck for rare classes is not the quantity of examples.
 
 ![Real vs synthetic ECG beats](docs/img/wgan_real_vs_synthetic.png)
 
@@ -470,9 +512,9 @@ This section is deliberately blunt — these are measured findings from the eval
 
 * **Cascade macro F1 is still moderate (0.34, 95% CI 0.24–0.44).** ~35.4% of true anomalous beats are classified correctly end-to-end, up from ~19.5% before switching the R-peak detector (see [R-Peak Detector Choice](#r-peak-detector-choice)) — but the remaining loss (Stage 1 false-negatives 25.3%, the detector 24.0%, Stage 2 misclassification 15.3%) is still a compounding-error problem across all three stages, not a single fixable bottleneck.
 * **Stage 1 sensitivity (0.658) is now the single largest remaining loss category (25.3% of lost anomalies).** Fixing the CV split's stratification (it was blind to AAMI subtype) raised it from 0.577 without trading away specificity or precision — but every anomaly still missed here can never reach Stage 2. Recalibrating the decision threshold away from 0.5 was tried two ways, on two independent training runs, and rejected every time: it either measurably hurts cascade macro F1, or its apparent gain is within bootstrap noise (see Stage 1 above).
-* **Multiclass performance is highly unstable across folds** (val accuracy 0.29–0.98, same model/data pipeline). Fold 2 in particular has the model *losing* to a trivial majority-class baseline. Traced to a small number of patients holding almost all of a given class's examples (e.g. 4 patients hold 99.8% of class Q) — the same root cause as the binary-stage issue above, not yet fixed for multiclass.
-* **Class F (fusion beats) is not learned at all** — 0.0 precision and recall throughout, both at the window level and in the cascade. F has the fewest samples of any AAMI class; the current data volume can't support learning it.
-* **WGAN-GP augmentation shows no measurable benefit** at current settings (mean Val Acc difference -0.011, within a ±0.347 inter-fold noise band) — see [WGAN-GP Case Study](#wgan-gp-case-study). Measured before the binary CV stratification fix and the R-peak detector switch above; not yet re-validated against either.
+* **Multiclass performance is highly unstable across folds** (val accuracy 0.29–0.98, same model/data pipeline), which made every other multiclass experiment unmeasurable. The dominant cause was class Q: 99.8% of it comes from four paced recordings, so each fold's Q validation set was effectively a single patient and fold results swung on *which* pacemaker was held out. Excluding Q (see [AAMI class scope](#aami-class-scope-why-q-paced-beats-are-excluded)) removes that source directly; the residual variance from class concentration in S/V/F is smaller but not eliminated, and has not yet been re-measured.
+* **Class F (fusion beats) is not learned at all** — 0.0 precision and recall throughout, both at the window level and in the cascade. Two interventions were measured against a matched baseline on identical fold splits and **both made things worse**: doubling F with WGAN-GP samples (F stayed at 0.00 F1 in 4 of 5 folds), and `balanced` class weighting (F recall rose to 0.06–0.88 but precision collapsed to ~0.00–0.11, i.e. the model was forced to guess F rather than taught to recognise it, while overall val accuracy fell from 0.77 to 0.50 and training destabilised — one fold scored AUC 0.40, below chance). F has ~72–93 training windows per fold against V/Q at 34–43× that; at this data volume it appears genuinely unlearnable rather than under-served.
+* **WGAN-GP augmentation shows no measurable benefit**, now tested properly rather than at a no-op dose. The original +5% growth cap generated only 3–4 synthetic F windows per fold; raised to +100% (≈600 synthetic windows per fold, a ~20× increase) and compared against a matched no-GAN run on identical fold splits, the GAN run was **worse on all four aggregate metrics and in 4 of 5 folds** (val accuracy 0.683 vs 0.772). See [WGAN-GP Case Study](#wgan-gp-case-study).
 * **The legacy Pan-Tompkins detector degraded badly on atypical records** (0.50–0.55 sensitivity on 2 of 10 tested records vs. ~0.97+ on the rest), which was the largest single source of cascade loss at one point (36.6%) — this motivated switching to `neurokit_detect` (see [R-Peak Detector Choice](#r-peak-detector-choice)), which cut the detector's loss share to 24.0%. Record 108 specifically remains weak (best measured: 0.67 sensitivity, from a 10-algorithm ensemble) across every detector tried so far.
 * **Small dataset overall**: `--selected-samples 40` records, which limits both training data volume and how representative each CV fold can be.
 
@@ -539,13 +581,15 @@ Potential applications include:
 * Champion vs Challenger evaluation (now computed in-job, not locally)
 * Model versioning
 * Switched the cascade's R-peak detector from a custom Pan-Tompkins implementation to `neurokit2` after a multi-stage, statistically validated comparison — see [R-Peak Detector Choice](#r-peak-detector-choice)
+* Settled the WGAN-GP question with a matched-baseline experiment at a meaningful augmentation dose, rather than leaving it "inconclusive" — see [Known Limitations](#known-limitations)
 
 ## In Progress
 
-* Improving Stage 1 sensitivity further (0.577 → 0.658 via CV stratification fix; now the single largest remaining loss category at 25.3% of lost anomalies). Threshold recalibration away from 0.5 was tried and rejected twice — see Stage 1 above.
+* **Excluding class Q (paced beats) from both stages** — decision made and documented in [AAMI class scope](#aami-class-scope-why-q-paced-beats-are-excluded); implementation and the first post-change training/evaluation runs are the immediate next step. Everything below is blocked on that, because Q dominated the fold variance that made other effects unmeasurable.
+* Re-measuring the whole evaluation suite on the S/V/F label set — every number in [Model Evaluation](#model-evaluation) predates the exclusion and will move
+* Improving Stage 1 sensitivity further (0.577 → 0.658 via CV stratification fix; the largest remaining loss category at 25.3% of lost anomalies). Threshold recalibration away from 0.5 was tried and rejected twice — see Stage 1 above.
 * Record 108 remains weak across every R-peak detector tried so far (best: 0.67 sensitivity, from a 10-algorithm ensemble) — may need per-record adaptive thresholding rather than a better fixed algorithm
-* Reducing multiclass fold-to-fold variance by applying the same CV stratification fix used for Stage 1 (root cause confirmed the same: a few patients dominate a given class's examples)
-* Making WGAN-GP augmentation actually move the needle, or concluding it isn't the right lever for this dataset size
+* Deciding what to do about class F, which neither synthetic augmentation nor class weighting made learnable — the realistic options are more data, merging it, or reporting it as out of scope
 
 ---
 
