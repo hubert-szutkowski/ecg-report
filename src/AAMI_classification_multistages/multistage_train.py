@@ -68,7 +68,7 @@ def build_parser():
     parser.add_argument("--gan-batch-size", type=int, default=32, help="Batch size for WGAN-GP training")
     parser.add_argument("--gan-critic-lr-multiplier", type=float, default=3.0, help="Critic LR as a multiple of --gan-start-learning-rate")
     parser.add_argument("--gan-start-learning-rate", type=float, default=5e-5, help="Generator learning rate for WGAN-GP")
-    parser.add_argument("--class-weight", type=str, default="none", choices=["none", "balanced"],
+    parser.add_argument("--class-weight", type=str, default="balanced", choices=["none", "balanced"],
                         help="Per-class loss weighting for the MULTICLASS stage. Default 'none' preserves the behaviour of every run made before this option existed, so past results stay comparable; 'balanced' uses sklearn's n/(k*count_c). The binary stage is unaffected - its BinaryFocalCrossentropy(alpha=0.25) already weights the anomaly class")
     parser.add_argument("--gan-max-growth", type=float, default=1.05, help="Cap on how much a class may grow from synthetic samples, as a multiple of its OWN current count (1.05 = +5%%). Note this scales with the class's own size, so the rarest classes get the fewest synthetic samples - see compute_gan_augmentation_plan's docstring")
     return parser
